@@ -45,10 +45,14 @@ class RedisFeatureStore:
         return json.loads(val) if val else {}
 
     def invalidate_recommendation_cache(self, user_id: str) -> int:
-        """Delete cached recommendation responses for one user."""
+        """Delete cached recommendation responses for one user.
 
+        ':reasons' 키는 삭제하지 않는다 — 추천 이유는 Gemini 호출이 필요하므로
+        검색/클릭 이벤트마다 재생성하지 않고 TTL(5분)이 만료될 때까지 유지한다.
+        """
         pattern = f"cache:recommend:{user_id}:*"
-        keys = list(self.r.scan_iter(match=pattern, count=100))
+        keys = [k for k in self.r.scan_iter(match=pattern, count=100)
+                if not k.endswith(":reasons")]
         if keys:
             return int(self.r.delete(*keys))
         return 0
