@@ -2,7 +2,8 @@
 Search Engine API — port 8002
 
 엔드포인트:
-  POST /search   텍스트/이미지/hybrid 검색
+  POST /search             텍스트/이미지/hybrid 검색
+  POST /cross-similarity   상품 간 임베딩 유사도 계산
   GET  /health
 """
 
@@ -148,6 +149,10 @@ class SearchRequest(BaseModel):
     top_k: int = 10
 
 
+class CrossSimilarityRequest(BaseModel):
+    article_ids: list[str]
+
+
 # ── 엔드포인트 ────────────────────────────────────────────────
 
 @app.post("/search")
@@ -218,6 +223,102 @@ async def search(req: SearchRequest) -> dict[str, Any]:
         "results": results,
         "latency_ms": round(latency_ms, 2),
         "total_count": len(results),
+    }
+
+
+def _normalize_article_id(article_id: str) -> str:
+    normalized = str(article_id).strip()
+    if normalized.isdigit():
+        return normalized.zfill(10)
+    return normalized
+
+
+def _item_index_by_article_id() -> dict[str, int]:
+    lookup: dict[str, int] = {}
+    for index, item in enumerate(search_engine.items):
+        candidate_ids = {
+            str(item.product_id),
+            str(item.metadata.get("product_id", "")),
+            str(item.metadata.get("article_id", "")),
+        }
+        for candidate_id in candidate_ids:
+            normalized = _normalize_article_id(candidate_id)
+            if normalized:
+                lookup[normalized] = index
+    return lookup
+
+
+def _embedding_for_item(index: int) -> np.ndarray | None:
+    if search_engine._embeddings is not None and 0 <= index < len(search_engine._embeddings):
+        return np.asarray(search_engine._embeddings[index], dtype=np.float32)
+
+    if search_engine.index is not None:
+        try:
+            return np.asarray(search_engine.index.reconstruct(index), dtype=np.float32)
+        except Exception:
+            LOGGER.debug("Failed to reconstruct embedding for index=%s; falling back to re-embedding.", index)
+
+    if 0 <= index < len(search_engine.items):
+        item = search_engine.items[index]
+        text = item.description or item.name or item.product_id
+        return search_engine.embedder.embed_item(text=text, image=None)
+    return None
+
+
+def _normalized_embedding_for_item(index: int) -> np.ndarray | None:
+    embedding = _embedding_for_item(index)
+    if embedding is None:
+        return None
+    vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    if norm == 0.0:
+        return None
+    return vector / norm
+
+
+@app.post("/cross-similarity")
+async def cross_similarity(req: CrossSimilarityRequest) -> dict[str, Any]:
+    """Return pairwise item similarity for outfit-set construction."""
+
+    start = time.perf_counter()
+    requested_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_id in req.article_ids[:100]:
+        normalized_id = _normalize_article_id(raw_id)
+        if normalized_id and normalized_id not in seen_ids:
+            requested_ids.append(normalized_id)
+            seen_ids.add(normalized_id)
+
+    index_lookup = _item_index_by_article_id()
+    vectors: dict[str, np.ndarray] = {}
+    missing_article_ids: list[str] = []
+    for article_id in requested_ids:
+        item_index = index_lookup.get(article_id)
+        if item_index is None:
+            missing_article_ids.append(article_id)
+            continue
+        vector = _normalized_embedding_for_item(item_index)
+        if vector is None:
+            missing_article_ids.append(article_id)
+            continue
+        vectors[article_id] = vector
+
+    similarity: dict[str, dict[str, float]] = {}
+    for left_id, left_vector in vectors.items():
+        row: dict[str, float] = {}
+        for right_id, right_vector in vectors.items():
+            if left_id == right_id:
+                continue
+            row[right_id] = round(float(np.dot(left_vector, right_vector)), 6)
+        similarity[left_id] = row
+
+    latency_ms = (time.perf_counter() - start) * 1000
+    return {
+        "similarity": similarity,
+        "article_ids": list(vectors.keys()),
+        "missing_article_ids": missing_article_ids,
+        "latency_ms": round(latency_ms, 2),
+        "total_count": len(vectors),
     }
 
 

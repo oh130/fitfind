@@ -14,7 +14,7 @@
 ## 주요 파일
 
 - [app.py](/C:/Users/user/multimodal-search/search_engine/app.py)
-  검색 API 서버. `/search`, `/health` 엔드포인트를 제공한다.
+  검색 API 서버. `/search`, `/cross-similarity`, `/health` 엔드포인트를 제공한다.
 - [search_engine.py](/C:/Users/user/multimodal-search/search_engine/search_engine.py)
   CLIP 임베딩, 상품 인덱싱, FAISS 검색 로직을 포함한다.
 - [generate_search_metrics_report.py](/C:/Users/user/multimodal-search/search_engine/generate_search_metrics_report.py)
@@ -52,7 +52,10 @@
 ## API 규격
 
 - 포트: `8002`
-- 엔드포인트: `POST /search`
+- 엔드포인트:
+  - `POST /search`
+  - `POST /cross-similarity`
+  - `GET /health`
 
 요청 예시:
 
@@ -87,6 +90,34 @@
 - `text`
 - `image`
 - `hybrid`
+
+### `POST /cross-similarity`
+
+추천 API Gateway의 예산 기반 세트 구성에서 사용한다. 요청한 상품 ID를 검색 인덱스의 상품 임베딩으로 변환한 뒤, 상품 간 cosine similarity 행렬을 반환한다.
+
+요청 예시:
+
+```json
+{
+  "article_ids": ["0825137001", "0717490032", "0673677002"]
+}
+```
+
+응답 예시:
+
+```json
+{
+  "similarity": {
+    "0825137001": {
+      "0717490032": 0.731245
+    }
+  },
+  "article_ids": ["0825137001", "0717490032"],
+  "missing_article_ids": ["0673677002"],
+  "latency_ms": 4.21,
+  "total_count": 2
+}
+```
 
 ## 로컬 실행
 
