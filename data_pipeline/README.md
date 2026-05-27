@@ -19,6 +19,8 @@ It produces the processed files used by search and recommendation experiments.
   - builds `data/processed/customer_features.csv`
 - `build_article_features.py`
   - builds `data/processed/articles_feature.csv`
+- `build_article_price_map.py`
+  - builds `data/processed/article_price_map.csv` from raw transactions for API price display backfill
 - `build_item_features.py`
   - builds item-level popularity and freshness features
 - `build_ranking_train_data.py`
@@ -43,6 +45,9 @@ If you only have the three raw dataset files and want the full pipeline to run i
 ```bash
 python data_pipeline/run_data_pipeline.py
 ```
+
+This also creates `data/processed/article_price_map.csv`, which the API uses for startup-safe price backfill.
+The API does not scan `transactions_train.csv` by default because the raw transaction file is large.
 
 ## Mode Guide
 
@@ -71,6 +76,7 @@ Common outputs:
 - `data/processed/customer_purchase_profile.csv`
 - `data/processed/customer_features.csv`
 - `data/processed/articles_feature.csv`
+- `data/processed/article_price_map.csv`
 
 Test mode outputs:
 - `data/processed/item_master_test.csv`
@@ -119,6 +125,7 @@ If you want to run each script manually, use this order:
 ```bash
 python data_pipeline/build_customer_features.py
 python data_pipeline/build_article_features.py
+python data_pipeline/build_article_price_map.py
 python data_pipeline/build_item_master.py
 python data_pipeline/build_customer_purchase_profile.py
 python data_pipeline/build_user_persona_scores.py
@@ -136,6 +143,8 @@ python data_pipeline/build_candidate_training_data.py
 
 - Run commands from the repository root.
 - Keep raw CSV files local only; do not commit them.
+- Run `python data_pipeline/build_article_price_map.py` before starting the API if you want broader price coverage without slow startup.
+- Set `ENABLE_RAW_TRANSACTION_PRICE_BACKFILL=1` only for one-off local debugging when scanning the full raw transaction file is acceptable.
 - `build_item_master.py` creates the item-level canonical table used by persona scoring and simulation.
 - `build_customer_purchase_profile.py` creates the customer-level purchase summary table used to derive persona ratios.
 - `build_sim_users.py` and `build_simulated_events.py` are offline data-generation scripts; they do not send API requests.

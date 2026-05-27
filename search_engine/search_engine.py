@@ -42,6 +42,8 @@ SEARCH_INDEX_FILENAMES = {
     "dev": ("search_dev_v2.index", "search_dev_v2_metadata.json"),
     "production": ("search_v2.index", "search_v2_metadata.json"),
 }
+SEARCH_INDEX_FORMAT = "clip_multimodal_v4"
+SUPPORTED_SEARCH_INDEX_FORMATS = {SEARCH_INDEX_FORMAT}
 CSV_STRING_COLUMNS = {
     "article_id": str,
     "product_code": str,
@@ -409,6 +411,7 @@ class MultimodalSearchEngine:
         self._image_item_indices: np.ndarray = np.empty((0,), dtype=np.int64)
         self._image_hash_to_item_index: Dict[str, int] = {}
         self._aux_vectors_path: Optional[Path] = None
+        self._source_articles_path: Optional[Path] = None
         self.index: Any = None
         self.text_index: Any = None
         self.image_index: Any = None
@@ -562,10 +565,10 @@ class MultimodalSearchEngine:
         local_root = Path(__file__).resolve().parent
         if mode_label == "dev":
             preferred = [
-                local_root / SEARCH_PAIR_MANIFEST_DEV,
-                self.data_root / SEARCH_PAIR_MANIFEST_DEV,
-                self.data_root / "item_master_dev.csv",
                 self.data_root / "articles_feature.csv",
+                self.data_root / "item_master_dev.csv",
+                self.data_root / SEARCH_PAIR_MANIFEST_DEV,
+                local_root / SEARCH_PAIR_MANIFEST_DEV,
             ]
         elif mode_label == "production":
             preferred = [
@@ -736,7 +739,7 @@ class MultimodalSearchEngine:
                 image_path = None
         if image_path is None:
             image_path = self._locate_article_image_path(row)
-        image = encode_image_file(image_path) if image_path is not None else None
+        image = None
         price = float(price_map.get(article_id, self._extract_price_from_row(row)))
         metadata = {
             "mode": mode_label,
@@ -778,6 +781,7 @@ class MultimodalSearchEngine:
 
     def _load_dev_items(self) -> List[SearchItem]:
         articles, articles_path = self._load_article_table("dev")
+        self._source_articles_path = articles_path
 
         price_map = self._load_article_price_map()
         shuffled = articles.sample(frac=1.0, random_state=self.random_seed).reset_index(drop=True)
@@ -811,6 +815,7 @@ class MultimodalSearchEngine:
     def _load_production_items(self) -> List[SearchItem]:
         # production 모드에서는 H&M articles.csv를 읽어 상품 메타데이터를 구성한다.
         articles, articles_path = self._load_article_table("production")
+        self._source_articles_path = articles_path
         price_map = self._load_article_price_map()
 
         items: List[SearchItem] = []
@@ -1067,6 +1072,14 @@ class MultimodalSearchEngine:
             return buffer.getvalue()
         return None
 
+    @staticmethod
+    def _load_item_image_for_embedding(item: SearchItem) -> Optional[Image.Image]:
+        if item.image is not None:
+            return item.image
+        if not item.image_path:
+            return None
+        return encode_image_file(item.image_path)
+
     def _metadata_hint_text(self, item: SearchItem) -> str:
         metadata = dict(item.metadata or {})
         tokens: List[str] = []
@@ -1186,25 +1199,41 @@ class MultimodalSearchEngine:
         text_vectors: List[np.ndarray] = []
         image_vectors: List[np.ndarray] = []
         self._image_hash_to_item_index = {}
-        for item in self.items:
+        total_items = len(self.items)
+        progress_interval = max(1, int(os.getenv("SEARCH_ENGINE_INDEX_PROGRESS_INTERVAL", "500")))
+        started_at = time.perf_counter()
+        LOGGER.info("Building %s search index for %d items", self.mode, total_items)
+        for item_index, item in enumerate(self.items, start=1):
             text_value = item.description or item.name
             text_vector = self.embedder.embed_text(text_value) if text_value else np.zeros(self.dimension, dtype=np.float32)
             text_vectors.append(text_vector)
             image_vector = None
-            if item.image is not None:
-                image_vector = self.embedder.embed_image(item.image)
-                if item.image_path:
-                    self.embedder.register_image_file_embedding(item.image_path, image_vector)
-                item.metadata["_image_embedding"] = image_vector.astype(np.float32).tolist()
-                image_bytes = self._read_item_image_bytes(item)
-                if image_bytes:
-                    item.metadata["_image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-                    self.embedder.register_image_bytes_embedding(image_bytes, image_vector)
-                    self._image_hash_to_item_index[self.embedder._hash_image_bytes(image_bytes)] = len(image_vectors)
+            image = self._load_item_image_for_embedding(item)
+            try:
+                if image is not None:
+                    image_vector = self.embedder.embed_image(image)
+                    item.metadata["_image_embedding"] = image_vector.astype(np.float32).tolist()
+                    image_bytes = self._read_item_image_bytes(item)
+                    if image_bytes:
+                        self.embedder.register_image_bytes_embedding(image_bytes, image_vector)
+                        self._image_hash_to_item_index[self.embedder._hash_image_bytes(image_bytes)] = len(image_vectors)
+            finally:
+                if image is not None and image is not item.image:
+                    image.close()
             image_vectors.append(
                 image_vector if image_vector is not None else np.zeros(self.dimension, dtype=np.float32)
             )
             vectors.append(self.embedder.combine_embeddings([text_vector, image_vector]))
+            if item_index == total_items or item_index % progress_interval == 0:
+                elapsed = max(time.perf_counter() - started_at, 0.001)
+                LOGGER.info(
+                    "Search index build progress: %d/%d items (%.1f%%, %.1f items/sec, %.1fs elapsed)",
+                    item_index,
+                    total_items,
+                    (item_index / total_items) * 100.0 if total_items else 100.0,
+                    item_index / elapsed,
+                    elapsed,
+                )
 
         if not vectors:
             raise ValueError("No items available to index")
@@ -1431,7 +1460,8 @@ class MultimodalSearchEngine:
         payload = {
             "mode": self.mode,
             "dimension": self.dimension,
-            "index_format": "clip_multimodal_v3",
+            "index_format": SEARCH_INDEX_FORMAT,
+            "build_config": self._artifact_build_config(),
             "aux_vectors_file": aux_path.name,
             "items": [
                 {
@@ -1440,28 +1470,43 @@ class MultimodalSearchEngine:
                     "price": item.price,
                     "description": item.description,
                     "image_path": item.image_path,
-                    "image_base64": self._serialize_item_image(item),
-                    "metadata": item.metadata,
+                    "metadata": self._metadata_for_artifact(item),
                 }
                 for item in self.items
             ],
         }
         Path(metadata_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+    def _artifact_build_config(self) -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "clip_model_name": self.embedder.model_name,
+            "item_count": len(self.items),
+            "source_articles": self._source_articles_build_config(),
+        }
+        if self.mode == "dev":
+            config["dev_sample_size"] = self.dev_sample_size
+            config["random_seed"] = self.random_seed
+        return config
+
+    def _source_articles_build_config(self) -> Dict[str, Any]:
+        if self._source_articles_path is None:
+            return {}
+        try:
+            source_path = Path(self._source_articles_path)
+            stat = source_path.stat()
+        except OSError:
+            return {}
+        return {
+            "path": str(source_path),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
     @staticmethod
-    def _serialize_item_image(item: SearchItem) -> str | None:
-        if item.image_path:
-            image_path = Path(item.image_path)
-            if image_path.exists():
-                try:
-                    return base64.b64encode(image_path.read_bytes()).decode("utf-8")
-                except OSError:
-                    pass
-        if item.image is not None:
-            buffer = io.BytesIO()
-            item.image.save(buffer, format="PNG")
-            return base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return None
+    def _metadata_for_artifact(item: SearchItem) -> Dict[str, Any]:
+        metadata = dict(item.metadata or {})
+        metadata.pop("_image_base64", None)
+        return metadata
 
     @classmethod
     def load_from_artifacts(
@@ -1476,6 +1521,8 @@ class MultimodalSearchEngine:
         obj.mode = mode
         obj.data_root = cls._resolve_runtime_data_root(data_root)
         obj.top_k_default = DEFAULT_TOP_K
+        obj.random_seed = int(os.getenv("SEARCH_ENGINE_RANDOM_SEED", str(DEFAULT_RANDOM_SEED)))
+        obj.dev_sample_size = int(os.getenv("SEARCH_ENGINE_DEV_SAMPLE_SIZE", str(DEFAULT_DEV_SAMPLE_SIZE)))
         obj.embedder = OpenAIClipEmbedder(model_name=clip_model_name)
         obj.dimension = int(obj.embedder.dim or 512)
         obj.text_index = None
@@ -1485,6 +1532,7 @@ class MultimodalSearchEngine:
         obj._image_item_indices = np.empty((0,), dtype=np.int64)
         obj._image_hash_to_item_index = {}
         obj._aux_vectors_path = None
+        obj._source_articles_path = None
         if faiss is not None:
             obj.index = faiss.read_index(index_path)
         else:
@@ -1533,13 +1581,23 @@ class MultimodalSearchEngine:
         obj._is_built = True
         obj.item_ids = [str(item.product_id) for item in obj.items]
         for idx, item in enumerate(obj.items):
-            embedding_values = item.metadata.get("_image_embedding")
-            image_base64 = str(item.metadata.get("_image_base64", "")).strip()
-            if not embedding_values or not image_base64:
+            image_vector = None
+            if obj._image_embeddings is not None and idx < len(obj._image_embeddings):
+                image_vector = np.asarray(obj._image_embeddings[idx], dtype=np.float32)
+            else:
+                embedding_values = item.metadata.get("_image_embedding")
+                if embedding_values is not None:
+                    try:
+                        image_vector = np.asarray(embedding_values, dtype=np.float32)
+                    except Exception:
+                        image_vector = None
+            if image_vector is None or image_vector.size == 0 or not np.any(image_vector):
+                continue
+            image_bytes = obj._read_item_image_bytes(item)
+            if not image_bytes:
                 continue
             try:
-                embedding = np.asarray(embedding_values, dtype=np.float32)
-                image_bytes = base64.b64decode(image_base64)
+                embedding = obj.embedder._normalize(image_vector)
                 obj.embedder.register_image_bytes_embedding(image_bytes, embedding)
                 obj._image_hash_to_item_index[obj.embedder._hash_image_bytes(image_bytes)] = idx
             except Exception:
@@ -1592,7 +1650,7 @@ class MultimodalSearchEngine:
         clip_model_name: str = CLIP_MODEL_NAME,
     ) -> "MultimodalSearchEngine":
         index_path, meta_path = cls.artifact_paths_for_mode(mode=mode, data_root=data_root, cache_dir=cache_dir)
-        if index_path.exists() and meta_path.exists():
+        if index_path.exists() and meta_path.exists() and cls._cached_artifacts_are_current(meta_path, mode, clip_model_name):
             try:
                 LOGGER.info("Loading cached %s search artifacts from %s", mode, index_path)
                 return cls.load_from_artifacts(
@@ -1604,6 +1662,8 @@ class MultimodalSearchEngine:
                 )
             except Exception as exc:
                 LOGGER.warning("Failed to load cached %s artifacts from %s: %s", mode, index_path, exc)
+        elif index_path.exists() and meta_path.exists():
+            LOGGER.info("Cached %s search artifacts are stale. Rebuilding %s artifacts.", mode, SEARCH_INDEX_FORMAT)
 
         LOGGER.info("No reusable %s search artifacts were found. Building index once and saving cache.", mode)
         engine = cls(mode=mode, data_root=data_root, clip_model_name=clip_model_name)
@@ -1611,6 +1671,68 @@ class MultimodalSearchEngine:
         engine.save_index(str(index_path), str(meta_path))
         LOGGER.info("Saved %s search artifacts to %s", mode, index_path)
         return engine
+
+    @staticmethod
+    def _cached_artifacts_are_current(meta_path: Path, mode: str, clip_model_name: str = CLIP_MODEL_NAME) -> bool:
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Failed to read cached search metadata %s: %s", meta_path, exc)
+            return False
+        if str(payload.get("index_format", "")) not in SUPPORTED_SEARCH_INDEX_FORMATS:
+            return False
+        normalized_mode = (mode or "").lower().strip()
+        if str(payload.get("mode", "")).lower() != normalized_mode:
+            return False
+
+        build_config = payload.get("build_config", {})
+        if not isinstance(build_config, dict):
+            return False
+        if str(build_config.get("clip_model_name", "")) != clip_model_name:
+            return False
+        payload_items = payload.get("items", [])
+        if not isinstance(payload_items, list):
+            return False
+        try:
+            cached_item_count = int(build_config.get("item_count", len(payload_items)))
+        except (TypeError, ValueError):
+            return False
+        if cached_item_count != len(payload_items):
+            return False
+        if normalized_mode in {"dev", "production"}:
+            source_articles = build_config.get("source_articles", {})
+            if not MultimodalSearchEngine._cached_source_articles_are_current(source_articles):
+                return False
+        if normalized_mode != "dev":
+            return True
+
+        expected_sample_size = int(os.getenv("SEARCH_ENGINE_DEV_SAMPLE_SIZE", str(DEFAULT_DEV_SAMPLE_SIZE)))
+        expected_random_seed = int(os.getenv("SEARCH_ENGINE_RANDOM_SEED", str(DEFAULT_RANDOM_SEED)))
+        try:
+            cached_sample_size = int(build_config.get("dev_sample_size", -1))
+            cached_random_seed = int(build_config.get("random_seed", -1))
+        except (TypeError, ValueError):
+            return False
+        return (
+            cached_sample_size == expected_sample_size
+            and cached_random_seed == expected_random_seed
+            and cached_item_count >= expected_sample_size
+        )
+
+    @staticmethod
+    def _cached_source_articles_are_current(source_config: Any) -> bool:
+        if not isinstance(source_config, dict):
+            return False
+        source_path = str(source_config.get("path", "")).strip()
+        if not source_path:
+            return False
+        try:
+            stat = Path(source_path).stat()
+            cached_size = int(source_config.get("size", -1))
+            cached_mtime_ns = int(source_config.get("mtime_ns", -1))
+        except (OSError, TypeError, ValueError):
+            return False
+        return cached_size == int(stat.st_size) and cached_mtime_ns == int(stat.st_mtime_ns)
 
     def find_item(self, product_id: str) -> Optional[SearchItem]:
         needle = normalize_article_id(product_id)

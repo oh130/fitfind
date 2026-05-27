@@ -11,6 +11,7 @@ services:
       - REC_MODELS_URL=http://rec-models:8003
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - IMAGE_ROOT=/app/data/raw/images
+      - ENABLE_RAW_TRANSACTION_PRICE_BACKFILL=0
     depends_on:
       - redis
     volumes:
@@ -23,6 +24,7 @@ services:
       - "8002:8002"
     environment:
       - SEARCH_ENGINE_MODE=dev
+      - SEARCH_ENGINE_DEV_SAMPLE_SIZE=10000
       - SEARCH_ENGINE_DATA_ROOT=/app/data/processed
       - SEARCH_ENGINE_IMAGE_ROOT=/app/data/raw/images
     volumes:

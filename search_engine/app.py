@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import csv
 import io
-import json
 import logging
 import os
 import time
@@ -35,7 +34,6 @@ if (FILE_DIR / "data").exists():
 else:
     DEFAULT_PROJECT_DATA_DIR = FILE_DIR.parent / "data"
 DEFAULT_CACHE_DIR = DEFAULT_PROJECT_DATA_DIR / "faiss_index"
-INDEX_CACHE_VERSIONS = {"clip_multimodal_v2", "clip_multimodal_v3"}
 TEST_INDEX_PATH = DEFAULT_CACHE_DIR / "search_test_v2.index"
 TEST_META_PATH = DEFAULT_CACHE_DIR / "search_test_v2_metadata.json"
 DEV_INDEX_PATH = DEFAULT_CACHE_DIR / "search_dev_v2.index"
@@ -137,17 +135,7 @@ def _item_image_bytes(item: Any) -> bytes | None:
 
 
 def _artifacts_match(meta_path: Path, mode: str) -> bool:
-    if not meta_path.exists():
-        return False
-    try:
-        payload = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        LOGGER.warning("Failed to read search metadata %s: %s", meta_path, exc)
-        return False
-    return (
-        payload.get("index_format") in INDEX_CACHE_VERSIONS
-        and str(payload.get("mode", "")).lower() == mode
-    )
+    return meta_path.exists() and MultimodalSearchEngine._cached_artifacts_are_current(meta_path, mode)
 
 
 def _build_or_load_engine(mode: str) -> MultimodalSearchEngine:

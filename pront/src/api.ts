@@ -71,6 +71,7 @@ export type BudgetSetBundle = {
 export type ResultExplanation = {
   id: number;
   reason: string;
+  reason_source?: "gemini" | "local_fallback" | string;
 };
 
 const recommendationFallbackPalette = [

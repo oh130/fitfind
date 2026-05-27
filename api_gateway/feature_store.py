@@ -15,6 +15,8 @@ import redis
 RECENT_CLICKS_MAX = 20
 CLICK_TTL = 60 * 60 * 24 * 7  # 7일
 QUERY_INTEREST_CACHE_TTL = 60 * 60 * 24 * 7  # 7일
+SEARCH_INTENT_CACHE_TTL = 60 * 60 * 24 * 7  # 7일
+FALLBACK_SEARCH_INTENT_CACHE_TTL = 60 * 60  # 1시간
 PERSONA_SCORE_TTL = 60 * 60 * 24 * 30  # 30일
 
 
@@ -94,6 +96,29 @@ class RedisFeatureStore:
             self._query_interest_cache_key(query_text),
             json.dumps(interest),
             ex=QUERY_INTEREST_CACHE_TTL,
+        )
+
+    # ── 검색 의도 캐시 ──────────────────────────────────────
+    def _search_intent_cache_key(self, query_text: str) -> str:
+        normalized = query_text.strip().lower()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"cache:search_intent:{digest}"
+
+    def get_search_intent_cache(self, query_text: str) -> dict | None:
+        val = self.r.get(self._search_intent_cache_key(query_text))
+        if not val:
+            return None
+        try:
+            cached = json.loads(val)
+        except json.JSONDecodeError:
+            return None
+        return cached if isinstance(cached, dict) else None
+
+    def set_search_intent_cache(self, query_text: str, intent: dict, *, fallback: bool = False) -> None:
+        self.r.set(
+            self._search_intent_cache_key(query_text),
+            json.dumps(intent),
+            ex=FALLBACK_SEARCH_INTENT_CACHE_TTL if fallback else SEARCH_INTENT_CACHE_TTL,
         )
 
     # ── 통합 조회 ────────────────────────────────────────────

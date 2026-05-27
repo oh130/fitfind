@@ -35,6 +35,8 @@ REC_URL = os.getenv("REC_MODELS_URL", "http://rec-models:8003")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_COOLDOWN_SECONDS = int(os.getenv("GEMINI_COOLDOWN_SECONDS", "600"))
+GEMINI_COOLDOWN_KEY = "service:gemini:cooldown"
 
 DEFAULT_IMAGE_ROOT = Path("/app/data/raw/images")
 LOCAL_IMAGE_ROOT = Path(__file__).resolve().parents[1] / "data" / "raw" / "images"
@@ -47,6 +49,10 @@ if not IMAGE_ROOT.exists():
             break
 
 ARTICLES_PATH = Path("/app/data/processed/articles_feature.csv")
+ARTICLE_PRICE_MAP_PATH = Path("/app/data/processed/article_price_map.csv")
+LOCAL_ARTICLE_PRICE_MAP_PATH = Path(__file__).resolve().parents[1] / "data" / "processed" / "article_price_map.csv"
+RAW_TRANSACTIONS_PATH = Path("/app/data/raw/transactions_train.csv")
+LOCAL_RAW_TRANSACTIONS_PATH = Path(__file__).resolve().parents[1] / "data" / "raw" / "transactions_train.csv"
 # item_features_{test,dev,prod}.csv — avg_price 컬럼 포함
 _ITEM_FEATURES_CANDIDATES = [
     Path("/app/data/processed/item_features_test.csv"),
@@ -66,6 +72,107 @@ def _brand_label(department_name: str | None) -> str:
     return f"H&M · {department}" if department else "H&M"
 
 
+def _load_feature_prices(meta: dict[str, dict]) -> int:
+    loaded_count = 0
+    for path in _ITEM_FEATURES_CANDIDATES:
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                aid = row.get("article_id", "").strip()
+                if aid not in meta or meta[aid]["price"]:
+                    continue
+                try:
+                    raw = float(row.get("avg_price", 0) or 0)
+                except (ValueError, TypeError):
+                    raw = 0
+                if raw > 0:
+                    meta[aid]["price"] = int(raw * PRICE_KRW_FACTOR)
+                    meta[aid]["price_source"] = "item_features"
+                    loaded_count += 1
+    return loaded_count
+
+
+def _load_price_map_prices(meta: dict[str, dict]) -> int:
+    price_map_path = next(
+        (path for path in (ARTICLE_PRICE_MAP_PATH, LOCAL_ARTICLE_PRICE_MAP_PATH) if path.exists()),
+        None,
+    )
+    if price_map_path is None:
+        return 0
+
+    loaded_count = 0
+    with price_map_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            aid = row.get("article_id", "").strip()
+            if aid not in meta or meta[aid]["price"]:
+                continue
+            try:
+                raw = float(row.get("avg_price", row.get("price_mean", 0)) or 0)
+            except (ValueError, TypeError):
+                raw = 0
+            if raw > 0:
+                meta[aid]["price"] = int(raw * PRICE_KRW_FACTOR)
+                meta[aid]["price_source"] = "article_price_map"
+                loaded_count += 1
+    return loaded_count
+
+
+def _raw_transaction_backfill_enabled() -> bool:
+    return os.getenv("ENABLE_RAW_TRANSACTION_PRICE_BACKFILL", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _transaction_price_path() -> Path | None:
+    if not _raw_transaction_backfill_enabled():
+        logging.info(
+            "Raw transaction price backfill disabled. Run data_pipeline/build_article_price_map.py "
+            "to create article_price_map.csv for startup-safe price coverage."
+        )
+        return None
+    configured_path = Path(os.getenv("TRANSACTIONS_PATH", "")).expanduser() if os.getenv("TRANSACTIONS_PATH") else None
+    candidates = [path for path in (configured_path, RAW_TRANSACTIONS_PATH, LOCAL_RAW_TRANSACTIONS_PATH) if path]
+    return next((path for path in candidates if path.exists()), None)
+
+
+def _load_transaction_prices(meta: dict[str, dict]) -> int:
+    transaction_path = _transaction_price_path()
+    if transaction_path is None:
+        return 0
+
+    missing_ids = {aid for aid, item in meta.items() if not item.get("price")}
+    if not missing_ids:
+        return 0
+
+    price_sums: dict[str, float] = {}
+    price_counts: dict[str, int] = {}
+    with transaction_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            aid = row.get("article_id", "").strip()
+            if aid not in missing_ids:
+                continue
+            try:
+                price = float(row.get("price", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if price <= 0:
+                continue
+            price_sums[aid] = price_sums.get(aid, 0.0) + price
+            price_counts[aid] = price_counts.get(aid, 0) + 1
+
+    for aid, price_sum in price_sums.items():
+        count = price_counts.get(aid, 0)
+        if count > 0:
+            meta[aid]["price"] = int((price_sum / count) * PRICE_KRW_FACTOR)
+            meta[aid]["price_source"] = "transactions"
+
+    logging.info(
+        "Loaded transaction prices for %d articles from %s",
+        len(price_sums),
+        transaction_path,
+    )
+    return len(price_sums)
+
+
 def _load_article_meta() -> dict[str, dict]:
     meta: dict[str, dict] = {}
     if not ARTICLES_PATH.exists():
@@ -83,22 +190,22 @@ def _load_article_meta() -> dict[str, dict]:
                     "color": row.get("color", ""),
                     "product_type": row.get("product_type_name", ""),
                     "price": 0,
+                    "price_source": "",
                 }
 
-    # item_features CSV에서 avg_price 보강. dev/test/prod 산출물의 포함
-    # item이 다를 수 있으므로 첫 파일에서 멈추지 않고 가능한 값을 합친다.
-    for path in _ITEM_FEATURES_CANDIDATES:
-        if path.exists():
-            with path.open(encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    aid = row.get("article_id", "").strip()
-                    if aid in meta and not meta[aid]["price"]:
-                        try:
-                            raw = float(row.get("avg_price", 0) or 0)
-                            if raw > 0:
-                                meta[aid]["price"] = int(raw * PRICE_KRW_FACTOR)
-                        except (ValueError, TypeError):
-                            pass
+    price_map_count = _load_price_map_prices(meta)
+    feature_price_count = _load_feature_prices(meta)
+    transaction_price_count = _load_transaction_prices(meta)
+    priced_count = sum(1 for item in meta.values() if item.get("price"))
+    logging.info(
+        "Article metadata loaded: total=%d priced=%d price_map_prices=%d item_feature_prices=%d transaction_prices=%d coverage=%.1f%%",
+        len(meta),
+        priced_count,
+        price_map_count,
+        feature_price_count,
+        transaction_price_count,
+        (priced_count * 100 / len(meta)) if meta else 0.0,
+    )
 
     return meta
 
@@ -138,6 +245,18 @@ COLOR_QUERY_TERMS: dict[str, tuple[str, ...]] = {
     "beige": ("beige", "베이지"),
     "green": ("green", "초록", "그린", "카키"),
     "yellow": ("yellow", "노랑", "옐로"),
+}
+
+COLOR_INTENT_TERMS: dict[str, str] = {
+    "black": "black",
+    "white": "white",
+    "blue": "blue navy",
+    "red": "red",
+    "pink": "pink",
+    "grey": "grey gray",
+    "beige": "beige",
+    "green": "green khaki",
+    "yellow": "yellow",
 }
 
 TARGET_AUDIENCE_TO_MAIN_CATEGORY: dict[str, set[str]] = {
@@ -187,12 +306,14 @@ def _target_audience_interest(target_audience: str | None) -> str | None:
 DEFAULT_PRICE_BY_PRODUCT: tuple[tuple[tuple[str, ...], int], ...] = (
     (("coat", "jacket", "blazer", "parka"), 79000),
     (("dress", "jumpsuit", "playsuit"), 59000),
-    (("jeans", "trousers", "pants"), 49000),
+    (("jeans", "trousers", "pants", "slacks", "chino", "jogger", "cargo"), 49000),
     (("skirt", "shorts"), 39000),
     (("shirt", "blouse", "sweater", "cardigan", "hoodie", "sweatshirt"), 39000),
-    (("sneakers", "shoes", "boots"), 69000),
+    (("sneakers", "shoes", "boots", "sandals", "slippers", "pumps", "heels"), 69000),
     (("bag", "backpack"), 49000),
     (("swimsuit", "bikini"), 29000),
+    (("bra", "underwear", "panties"), 19000),
+    (("pyjama", "pajama", "robe", "night gown"), 39000),
     (("t-shirt", "tee", "top", "vest"), 25000),
 )
 
@@ -227,23 +348,155 @@ def _display_price(meta: dict, item: dict | None = None) -> tuple[int, bool]:
         return price, False
     return _estimated_price_for_meta(meta, item), True
 
+
+def _price_source_label(meta: dict, price_estimated: bool) -> str:
+    if price_estimated:
+        return "estimated"
+    return str(meta.get("price_source") or "observed")
+
+
+def _term_matches_text(text: str, term: str) -> bool:
+    normalized_term = " ".join(str(term or "").lower().split())
+    if not normalized_term:
+        return False
+    if any(ord(char) > 127 for char in normalized_term):
+        return normalized_term in text
+
+    pattern = re.escape(normalized_term).replace(r"\ ", r"\s+")
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text) is not None
+
+
+def _any_term_matches_text(text: str, terms: tuple[str, ...]) -> bool:
+    return any(_term_matches_text(text, term) for term in terms)
+
+
 PRODUCT_QUERY_TERMS: dict[str, tuple[str, ...]] = {
     "dress": ("dress", "one-piece", "one piece", "원피스", "드레스"),
     "t-shirt": ("t-shirt", "tee", "t shirt", "티셔츠", "반팔"),
     "sweatshirt": ("sweatshirt", "sweat shirt", "맨투맨", "스웨트셔츠"),
-    "sweater": ("sweater", "knit", "knitwear", "jumper", "니트", "스웨터"),
+    "sweater": ("sweater", "knit", "knitwear", "jumper", "pullover", "니트", "스웨터"),
+    "cardigan": ("cardigan", "가디건"),
     "shirt": ("shirt", "셔츠"),
     "blouse": ("blouse", "블라우스"),
     "hoodie": ("hoodie", "hood", "후드", "후디"),
     "jacket": ("jacket", "자켓", "재킷"),
+    "blazer": ("blazer", "블레이저"),
     "coat": ("coat", "코트"),
     "skirt": ("skirt", "스커트", "치마"),
-    "trousers": ("trousers", "pants", "바지", "팬츠"),
+    "trousers": (
+        "trousers",
+        "pants",
+        "slacks",
+        "slack",
+        "chino",
+        "chinos",
+        "jogger",
+        "joggers",
+        "cargo pants",
+        "cargo",
+        "sweatpants",
+        "바지",
+        "팬츠",
+        "슬랙스",
+        "치노",
+        "조거",
+        "조거팬츠",
+        "카고",
+        "카고팬츠",
+        "트레이닝바지",
+        "와이드팬츠",
+    ),
+    "shorts": ("shorts", "short pants", "반바지", "쇼츠", "숏팬츠"),
     "jeans": ("jeans", "denim", "청바지", "데님"),
     "sneakers": ("sneakers", "운동화", "스니커즈"),
     "boots": ("boots", "boot", "부츠"),
+    "sandals": ("sandals", "sandal", "heeled sandals", "flip flop", "flip-flop", "쪼리", "샌들", "플립플롭"),
+    "slippers": ("slippers", "slipper", "slider", "slides", "슬리퍼", "실내화"),
+    "heels": ("heels", "heel", "pumps", "pump", "wedge", "heeled sandals", "힐", "구두", "펌프스", "웨지"),
+    "flats": ("flats", "flat shoe", "flat shoes", "ballerinas", "ballerina", "loafer", "loafers", "플랫", "로퍼", "발레리나"),
     "shoes": ("shoes", "shoe", "신발"),
-    "bag": ("bag", "가방", "백"),
+    "vest-top": ("vest top", "tank top", "tanktop", "sleeveless top", "waistcoat", "나시", "민소매", "탱크탑", "조끼", "베스트"),
+    "polo": ("polo", "polo shirt", "폴로", "폴로티", "카라티"),
+    "bodysuit": ("bodysuit", "body suit", "바디수트"),
+    "jumpsuit": ("jumpsuit", "playsuit", "점프수트", "플레이수트"),
+    "dungarees": ("dungarees", "overall", "overalls", "멜빵바지", "오버롤"),
+    "garment-set": ("garment set", "set", "two-piece", "two piece", "세트", "투피스"),
+    "swimwear": ("swimwear", "swimsuit", "bikini", "bikini top", "rash guard", "rashguard", "수영복", "비키니", "래시가드"),
+    "underwear": ("underwear", "panties", "briefs", "boxers", "속옷", "팬티", "드로즈", "브리프"),
+    "bra": ("bra", "bralette", "브라", "브래지어"),
+    "pyjama": ("pyjama", "pajama", "nightwear", "night gown", "nightgown", "sleepwear", "잠옷", "파자마", "나이트가운"),
+    "robe": ("robe", "bathrobe", "가운", "로브"),
+    "bag": (
+        "bag",
+        "backpack",
+        "cross-body bag",
+        "crossbody",
+        "tote",
+        "tote bag",
+        "shoulder bag",
+        "bumbag",
+        "weekend bag",
+        "가방",
+        "백",
+        "백팩",
+        "크로스백",
+        "토트백",
+        "숄더백",
+        "힙색",
+    ),
+    "hat": (
+        "hat",
+        "cap",
+        "beanie",
+        "bucket hat",
+        "straw hat",
+        "strawhat",
+        "sunhat",
+        "snapback",
+        "fedora",
+        "모자",
+        "캡",
+        "비니",
+        "버킷햇",
+        "벙거지",
+        "볼캡",
+        "야구모자",
+        "스냅백",
+        "페도라",
+    ),
+    "socks": ("socks", "sock", "ankle sock", "anklesock", "sportsock", "양말", "삭스"),
+    "tights": ("tights", "legging", "leggings", "leggings/tights", "stockings", "스타킹", "타이즈", "타이츠", "레깅스"),
+    "scarf": ("scarf", "scarves", "muffler", "스카프", "머플러"),
+    "belt": ("belt", "벨트"),
+    "gloves": ("gloves", "glove", "장갑"),
+    "sunglasses": ("sunglasses", "shades", "선글라스"),
+    "jewelry": ("jewelry", "jewellery", "주얼리", "쥬얼리", "장신구"),
+    "earrings": ("earring", "earrings", "귀걸이", "이어링"),
+    "necklace": ("necklace", "목걸이"),
+    "ring": ("ring", "rings", "반지"),
+    "bracelet": ("bracelet", "bracelets", "팔찌"),
+    "watch": ("watch", "watches", "시계"),
+    "hair-accessory": (
+        "hair clip",
+        "hair string",
+        "hair ties",
+        "hair band",
+        "hairband",
+        "alice band",
+        "headband",
+        "헤어밴드",
+        "머리띠",
+        "헤어핀",
+        "머리핀",
+        "헤어끈",
+        "머리끈",
+        "헤어악세사리",
+        "헤어액세서리",
+    ),
+    "wallet": ("wallet", "지갑"),
+    "umbrella": ("umbrella", "우산"),
+    "tie": ("tie", "necktie", "넥타이"),
+    "accessory": ("accessory", "accessories", "액세서리", "엑세서리", "악세사리", "잡화"),
 }
 
 PRODUCT_MATCH_TERMS: dict[str, tuple[str, ...]] = {
@@ -251,18 +504,181 @@ PRODUCT_MATCH_TERMS: dict[str, tuple[str, ...]] = {
     "t-shirt": ("t-shirt", "tee"),
     "sweatshirt": ("sweatshirt", "sweat shirt"),
     "sweater": ("sweater", "knit", "knitted", "jumper", "pullover", "cardigan"),
+    "cardigan": ("cardigan",),
     "shirt": ("shirt",),
     "blouse": ("blouse",),
     "hoodie": ("hoodie", "hooded", "hood"),
     "jacket": ("jacket", "blazer", "parka"),
+    "blazer": ("blazer",),
     "coat": ("coat",),
     "skirt": ("skirt",),
-    "trousers": ("trousers", "pants"),
+    "trousers": (
+        "trousers",
+        "pants",
+        "slacks",
+        "slack",
+        "chino",
+        "chinos",
+        "jogger",
+        "joggers",
+        "cargo pants",
+        "cargo",
+        "sweatpants",
+        "outdoor trousers",
+    ),
+    "shorts": ("shorts",),
     "jeans": ("jeans", "denim"),
     "sneakers": ("sneakers", "trainer"),
     "boots": ("boots", "boot"),
-    "shoes": ("shoes", "shoe", "sneakers", "boots"),
-    "bag": ("bag",),
+    "sandals": ("sandals", "sandal", "heeled sandals", "flip flop", "flip-flop"),
+    "slippers": ("slippers", "slipper", "slider", "slides"),
+    "heels": ("heels", "heel", "pumps", "pump", "wedge", "heeled sandals"),
+    "flats": ("flat shoe", "flat shoes", "ballerinas", "ballerina", "loafer", "loafers", "car shoe", "espadrille"),
+    "shoes": (
+        "shoes",
+        "shoe",
+        "sneakers",
+        "boots",
+        "sandals",
+        "slippers",
+        "pumps",
+        "heels",
+        "flat shoe",
+        "ballerinas",
+    ),
+    "vest-top": ("vest top", "tanktop", "tank top", "waistcoat", "outdoor waistcoat", "tailored waistcoat"),
+    "polo": ("polo shirt", "polo"),
+    "bodysuit": ("bodysuit", "body suit"),
+    "jumpsuit": ("jumpsuit/playsuit", "jumpsuit", "playsuit"),
+    "dungarees": ("dungarees", "overall", "overalls"),
+    "garment-set": ("garment set",),
+    "swimwear": ("swimwear", "swimsuit", "swimwear bottom", "swimwear top", "swimwear set", "bikini top", "bikini", "sarong"),
+    "underwear": ("underwear bottom", "underwear body", "underwear set", "kids underwear top", "briefs", "boxers", "panties"),
+    "bra": ("bra", "bralette"),
+    "pyjama": ("pyjama set", "pyjama jumpsuit/playsuit", "pyjama bottom", "night gown", "nightgown", "sleeping sack"),
+    "robe": ("robe",),
+    "bag": ("bag", "backpack", "cross-body bag", "crossbody", "tote bag", "shoulder bag", "bumbag", "weekend/gym bag"),
+    "hat": (
+        "hat/beanie",
+        "hat/brim",
+        "hat",
+        "beanie",
+        "cap/peaked",
+        "cap",
+        "bucket hat",
+        "straw hat",
+        "strawhat",
+        "sunhat",
+        "felt hat",
+        "p-cap",
+        "peak cap",
+        "snowcap",
+    ),
+    "socks": ("socks", "sock", "ankle sock", "anklesock", "sportsock"),
+    "tights": ("leggings/tights", "underwear tights", "leggings", "legging", "tights", "stockings"),
+    "scarf": ("scarf",),
+    "belt": ("belt",),
+    "gloves": ("gloves", "glove"),
+    "sunglasses": ("sunglasses",),
+    "jewelry": ("jewelry", "jewellery", "earring", "earrings", "necklace", "ring", "bracelet", "watch"),
+    "earrings": ("earring", "earrings"),
+    "necklace": ("necklace",),
+    "ring": ("ring",),
+    "bracelet": ("bracelet",),
+    "watch": ("watch",),
+    "hair-accessory": ("hair/alice band", "hair clip", "hair string", "hair ties", "hairband", "alice band", "headband"),
+    "wallet": ("wallet",),
+    "umbrella": ("umbrella",),
+    "tie": ("tie",),
+    "accessory": (
+        "accessories",
+        "accessories set",
+        "other accessories",
+        "bag",
+        "backpack",
+        "cross-body bag",
+        "tote bag",
+        "shoulder bag",
+        "bumbag",
+        "hat/beanie",
+        "hat/brim",
+        "cap/peaked",
+        "bucket hat",
+        "straw hat",
+        "felt hat",
+        "scarf",
+        "belt",
+        "gloves",
+        "sunglasses",
+        "earring",
+        "earrings",
+        "necklace",
+        "ring",
+        "bracelet",
+        "watch",
+        "hair/alice band",
+        "hair clip",
+        "hair string",
+        "hair ties",
+        "wallet",
+        "umbrella",
+        "tie",
+    ),
+}
+
+PRODUCT_INTENT_TERMS: dict[str, tuple[str, ...]] = {
+    "dress": ("dress", "one-piece dress"),
+    "t-shirt": ("t-shirt", "tee", "short sleeve top"),
+    "sweatshirt": ("sweatshirt", "crewneck sweatshirt"),
+    "sweater": ("sweater", "knitwear", "jumper", "pullover"),
+    "cardigan": ("cardigan", "knit cardigan"),
+    "shirt": ("shirt", "button shirt"),
+    "blouse": ("blouse",),
+    "hoodie": ("hoodie", "hooded sweatshirt"),
+    "jacket": ("jacket", "outerwear"),
+    "blazer": ("blazer", "tailored jacket"),
+    "coat": ("coat", "outerwear"),
+    "skirt": ("skirt",),
+    "trousers": ("trousers", "pants", "slacks", "chinos", "joggers", "cargo pants"),
+    "shorts": ("shorts", "short pants"),
+    "jeans": ("jeans", "denim pants"),
+    "sneakers": ("sneakers", "trainers"),
+    "boots": ("boots",),
+    "sandals": ("sandals", "flip flop", "heeled sandals"),
+    "slippers": ("slippers", "slides"),
+    "heels": ("heels", "pumps", "wedge heels"),
+    "flats": ("flat shoes", "ballerinas", "loafers"),
+    "shoes": ("shoes",),
+    "vest-top": ("vest top", "tank top", "sleeveless top"),
+    "polo": ("polo shirt",),
+    "bodysuit": ("bodysuit",),
+    "jumpsuit": ("jumpsuit", "playsuit"),
+    "dungarees": ("dungarees", "overalls"),
+    "garment-set": ("garment set", "two-piece set"),
+    "swimwear": ("swimwear", "swimsuit", "bikini"),
+    "underwear": ("underwear", "panties", "briefs"),
+    "bra": ("bra", "bralette"),
+    "pyjama": ("pyjama", "pajama", "nightwear", "sleepwear"),
+    "robe": ("robe", "bathrobe"),
+    "bag": ("bag", "backpack", "tote bag", "shoulder bag", "cross-body bag"),
+    "hat": ("hat", "cap", "beanie", "bucket hat", "straw hat"),
+    "socks": ("socks", "ankle socks"),
+    "tights": ("tights", "leggings", "stockings"),
+    "scarf": ("scarf", "muffler"),
+    "belt": ("belt",),
+    "gloves": ("gloves",),
+    "sunglasses": ("sunglasses",),
+    "jewelry": ("jewelry", "earrings", "necklace", "ring", "bracelet"),
+    "earrings": ("earrings", "earring"),
+    "necklace": ("necklace",),
+    "ring": ("ring",),
+    "bracelet": ("bracelet",),
+    "watch": ("watch",),
+    "hair-accessory": ("hair accessory", "hair clip", "headband", "hair ties"),
+    "wallet": ("wallet",),
+    "umbrella": ("umbrella",),
+    "tie": ("tie", "necktie"),
+    "accessory": ("accessories", "fashion accessories"),
 }
 
 PRODUCT_DISPLAY_LABELS: dict[str, str] = {
@@ -270,46 +686,138 @@ PRODUCT_DISPLAY_LABELS: dict[str, str] = {
     "t-shirt": "T-shirt",
     "sweatshirt": "Sweatshirt",
     "sweater": "Sweater",
+    "cardigan": "Cardigan",
     "shirt": "Shirt",
     "blouse": "Blouse",
     "hoodie": "Hoodie",
     "jacket": "Jacket",
+    "blazer": "Blazer",
     "coat": "Coat",
     "skirt": "Skirt",
     "trousers": "Trousers",
+    "shorts": "Shorts",
     "jeans": "Jeans",
     "sneakers": "Sneakers",
     "boots": "Boots",
+    "sandals": "Sandals",
+    "slippers": "Slippers",
+    "heels": "Heels",
+    "flats": "Flats",
     "shoes": "Shoes",
+    "vest-top": "Vest top",
+    "polo": "Polo shirt",
+    "bodysuit": "Bodysuit",
+    "jumpsuit": "Jumpsuit/Playsuit",
+    "dungarees": "Dungarees",
+    "garment-set": "Garment Set",
+    "swimwear": "Swimwear",
+    "underwear": "Underwear",
+    "bra": "Bra",
+    "pyjama": "Pyjama",
+    "robe": "Robe",
     "bag": "Bag",
+    "hat": "Hat",
+    "socks": "Socks",
+    "tights": "Tights",
+    "scarf": "Scarf",
+    "belt": "Belt",
+    "gloves": "Gloves",
+    "sunglasses": "Sunglasses",
+    "jewelry": "Jewelry",
+    "earrings": "Earrings",
+    "necklace": "Necklace",
+    "ring": "Ring",
+    "bracelet": "Bracelet",
+    "watch": "Watch",
+    "hair-accessory": "Hair accessory",
+    "wallet": "Wallet",
+    "umbrella": "Umbrella",
+    "tie": "Tie",
+    "accessory": "Accessory",
 }
 
 PRODUCT_EXCLUDE_TERMS: dict[str, tuple[str, ...]] = {
     "shirt": ("t-shirt", "t shirt", "tee", "sweatshirt", "hoodie", "hooded"),
-    "sneakers": ("boots", "boot", "heels", "sandals"),
+    "sneakers": ("boots", "boot", "heels", "sandals", "slippers"),
     "boots": ("bootcut",),
     "hoodie": (),
+    "socks": ("sock runner", "sock sneaker", "sockboot", "sock boot", "sneakers", "shoes", "boots"),
+    "shorts": ("shorttop", "short-sleeved", "short sleeve"),
+    "bra": ("bracelet",),
+    "robe": ("wardrobe",),
 }
 
 PRODUCT_DOMINANCE_RULES: dict[str, tuple[str, ...]] = {
     "t-shirt": ("shirt",),
+    "cardigan": ("sweater",),
     "hoodie": ("sweatshirt", "sweater"),
+    "blazer": ("jacket",),
+    "jeans": ("trousers",),
+    "shorts": ("trousers",),
     "sneakers": ("shoes",),
     "boots": ("shoes",),
+    "sandals": ("shoes",),
+    "slippers": ("shoes",),
+    "heels": ("shoes", "sandals"),
+    "flats": ("shoes",),
+    "bra": ("underwear",),
+    "robe": ("pyjama",),
+    "dungarees": ("trousers",),
+    "bag": ("accessory",),
+    "hat": ("accessory",),
+    "socks": ("accessory",),
+    "tights": ("accessory",),
+    "scarf": ("accessory",),
+    "belt": ("accessory",),
+    "gloves": ("accessory",),
+    "sunglasses": ("accessory",),
+    "jewelry": ("accessory",),
+    "earrings": ("jewelry", "accessory"),
+    "necklace": ("jewelry", "accessory"),
+    "ring": ("jewelry", "accessory"),
+    "bracelet": ("jewelry", "accessory"),
+    "watch": ("jewelry", "accessory"),
+    "hair-accessory": ("accessory",),
+    "wallet": ("accessory",),
+    "umbrella": ("accessory",),
+    "tie": ("accessory",),
 }
 
 COMPLEMENT_PRODUCT_GROUPS: dict[str, tuple[str, ...]] = {
-    "dress": ("jacket", "coat", "sweater", "cardigan", "boots", "sneakers", "bag"),
-    "t-shirt": ("trousers", "jeans", "skirt", "jacket", "sneakers", "bag"),
-    "shirt": ("trousers", "jeans", "skirt", "jacket", "sneakers", "bag"),
-    "hoodie": ("trousers", "jeans", "sneakers", "jacket", "bag"),
+    "dress": ("jacket", "coat", "sweater", "cardigan", "boots", "heels", "sneakers", "bag"),
+    "t-shirt": ("trousers", "jeans", "shorts", "skirt", "jacket", "sneakers", "bag", "hat"),
+    "shirt": ("trousers", "jeans", "shorts", "skirt", "jacket", "blazer", "sneakers", "bag", "hat"),
+    "hoodie": ("trousers", "jeans", "sneakers", "jacket", "bag", "hat"),
+    "cardigan": ("t-shirt", "shirt", "dress", "jeans", "skirt"),
     "jacket": ("t-shirt", "shirt", "trousers", "jeans", "skirt", "dress"),
-    "coat": ("t-shirt", "shirt", "trousers", "jeans", "skirt", "dress"),
+    "blazer": ("shirt", "blouse", "trousers", "jeans", "skirt", "dress"),
+    "coat": ("t-shirt", "shirt", "sweater", "trousers", "jeans", "skirt", "dress", "scarf"),
     "skirt": ("t-shirt", "shirt", "sweater", "jacket", "sneakers"),
-    "trousers": ("t-shirt", "shirt", "sweater", "jacket", "sneakers"),
+    "trousers": ("t-shirt", "shirt", "sweater", "jacket", "sneakers", "belt"),
+    "shorts": ("t-shirt", "shirt", "sneakers", "sandals"),
     "jeans": ("t-shirt", "shirt", "sweater", "jacket", "sneakers"),
     "sneakers": ("t-shirt", "hoodie", "trousers", "jeans"),
+    "sandals": ("dress", "skirt", "shorts", "swimwear"),
+    "slippers": ("pyjama", "robe", "shorts"),
+    "heels": ("dress", "skirt", "blazer", "trousers"),
+    "flats": ("dress", "skirt", "trousers", "jeans"),
+    "vest-top": ("shorts", "jeans", "skirt", "cardigan"),
+    "polo": ("trousers", "shorts", "jeans", "sneakers"),
+    "swimwear": ("sandals", "hat", "sunglasses", "bag"),
+    "underwear": ("robe", "pyjama"),
+    "bra": ("underwear", "robe"),
+    "pyjama": ("robe", "slippers"),
+    "robe": ("pyjama", "slippers"),
     "bag": ("dress", "jacket", "t-shirt", "shirt"),
+    "hat": ("hoodie", "jacket", "coat", "t-shirt", "sweater"),
+    "socks": ("sneakers", "boots", "trousers", "jeans"),
+    "tights": ("skirt", "dress", "boots"),
+    "scarf": ("coat", "jacket", "sweater"),
+    "belt": ("trousers", "jeans", "dress", "shirt"),
+    "gloves": ("coat", "jacket", "scarf"),
+    "sunglasses": ("dress", "t-shirt", "shirt", "hat"),
+    "jewelry": ("dress", "blouse", "shirt"),
+    "accessory": ("dress", "jacket", "t-shirt", "shirt", "bag", "hat"),
 }
 
 COLOR_COMPLEMENTS: dict[str, tuple[str, ...]] = {
@@ -325,22 +833,58 @@ COLOR_COMPLEMENTS: dict[str, tuple[str, ...]] = {
 }
 
 PRODUCT_GROUP_PRIORITY: dict[str, int] = {
+    "blazer": 92,
     "jacket": 90,
     "coat": 88,
-    "trousers": 86,
+    "shorts": 87,
     "jeans": 86,
+    "trousers": 85,
     "skirt": 84,
+    "slippers": 83,
+    "sandals": 83,
+    "heels": 83,
+    "flats": 83,
     "sneakers": 82,
     "boots": 82,
+    "hat": 80,
     "bag": 78,
+    "sunglasses": 77,
+    "scarf": 76,
+    "belt": 75,
+    "gloves": 74,
+    "jewelry": 73,
     "hoodie": 72,
     "sweatshirt": 71,
+    "cardigan": 71,
     "sweater": 70,
     "blouse": 69,
     "shirt": 68,
+    "polo": 67,
     "t-shirt": 66,
+    "vest-top": 65,
     "dress": 64,
+    "socks": 63,
+    "tights": 62,
     "shoes": 60,
+    "swimwear": 59,
+    "jumpsuit": 59,
+    "bodysuit": 58,
+    "dungarees": 58,
+    "earrings": 58,
+    "necklace": 58,
+    "ring": 58,
+    "bracelet": 58,
+    "watch": 58,
+    "garment-set": 57,
+    "hair-accessory": 57,
+    "underwear": 56,
+    "bra": 56,
+    "pyjama": 56,
+    "robe": 56,
+    "wallet": 56,
+    "umbrella": 56,
+    "tie": 55,
+    "accessory": 50,
 }
 
 
@@ -349,12 +893,12 @@ def _derive_query_constraints(*texts: str | None) -> dict[str, set[str]]:
     colors = {
         color
         for color, terms in COLOR_QUERY_TERMS.items()
-        if any(term in normalized for term in terms)
+        if _any_term_matches_text(normalized, terms)
     }
     products = {
         product
         for product, terms in PRODUCT_QUERY_TERMS.items()
-        if any(term in normalized for term in terms)
+        if _any_term_matches_text(normalized, terms)
     }
     for specific_product, generic_products in PRODUCT_DOMINANCE_RULES.items():
         if specific_product in products:
@@ -380,11 +924,11 @@ def _item_product_text(item: dict) -> str:
 def _item_matches_product(item: dict, product: str) -> bool:
     text = _item_product_text(item)
     terms = PRODUCT_MATCH_TERMS.get(product, (product,))
-    if not any(term in text for term in terms):
+    if not _any_term_matches_text(text, terms):
         return False
 
     exclude_terms = PRODUCT_EXCLUDE_TERMS.get(product, ())
-    return not any(term in text for term in exclude_terms)
+    return not _any_term_matches_text(text, exclude_terms)
 
 
 def _query_constraint_matches(items: list[dict], constraints: dict[str, set[str]]) -> list[dict]:
@@ -467,6 +1011,96 @@ def _item_matches_query_product(item: dict, constraints: dict[str, set[str]]) ->
     if not products:
         return True
     return any(_item_matches_product(item, product) for product in products)
+
+
+def _catalog_item_for_article(article_id: str, meta: dict, *, score: float) -> dict:
+    price, price_estimated = _display_price(meta, None)
+    return {
+        "product_id": article_id,
+        "name": meta.get("name") or article_id,
+        "score": score,
+        "price": price,
+        "image_url": image_url_for_article(article_id),
+        "category": meta.get("category", ""),
+        "color": meta.get("color", ""),
+        "product_type": meta.get("product_type", ""),
+        "brand": meta.get("brand") or "H&M",
+        "main_category": meta.get("main_category", ""),
+        "price_estimated": price_estimated,
+        "price_source": _price_source_label(meta, price_estimated),
+        "reason": "catalog_constraint_backfill",
+        "catalog_backfill": True,
+    }
+
+
+def _catalog_constraint_candidates(
+    constraints: dict[str, set[str]],
+    *,
+    existing_ids: set[str],
+    limit: int,
+    require_color: bool,
+) -> list[dict]:
+    if not constraints["products"] or limit <= 0:
+        return []
+
+    effective_constraints = {
+        "products": set(constraints["products"]),
+        "colors": set(constraints["colors"]) if require_color else set(),
+    }
+    matches: list[dict] = []
+    for article_id, meta in article_meta.items():
+        if article_id in existing_ids:
+            continue
+        candidate = {
+            "product_id": article_id,
+            "name": meta.get("name", ""),
+            "category": meta.get("category", ""),
+            "product_type": meta.get("product_type", ""),
+            "color": meta.get("color", ""),
+            "main_category": meta.get("main_category", ""),
+        }
+        if not _item_matches_query_constraints(candidate, effective_constraints):
+            continue
+
+        product_priority = max(
+            (PRODUCT_GROUP_PRIORITY.get(product, 0) for product in constraints["products"] if _item_matches_product(candidate, product)),
+            default=0,
+        )
+        color_bonus = 8 if constraints["colors"] and _item_matches_query_color(candidate, constraints) else 0
+        score = 0.25 + (product_priority / 1000) + (color_bonus / 1000)
+        matches.append(_catalog_item_for_article(article_id, meta, score=score))
+        existing_ids.add(article_id)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def _with_catalog_constraint_backfill(items: list[dict], constraints: dict[str, set[str]], *, min_results: int) -> list[dict]:
+    if not constraints["products"] or min_results <= 0:
+        return items
+
+    existing_ids = {str(item.get("product_id", item.get("article_id", ""))) for item in items}
+    matching_count = len(_query_constraint_matches(items, constraints))
+    missing_count = max(0, min_results - matching_count)
+    if missing_count <= 0:
+        return items
+
+    backfill_items = _catalog_constraint_candidates(
+        constraints,
+        existing_ids=existing_ids,
+        limit=missing_count,
+        require_color=bool(constraints["colors"]),
+    )
+    if len(backfill_items) < missing_count and constraints["colors"]:
+        backfill_items.extend(
+            _catalog_constraint_candidates(
+                constraints,
+                existing_ids=existing_ids,
+                limit=missing_count - len(backfill_items),
+                require_color=False,
+            )
+        )
+    return items + backfill_items
 
 
 def _item_matches_any_product_group(item: dict, product_groups: set[str]) -> bool:
@@ -726,7 +1360,33 @@ def _infer_session_interest_from_query_keywords(query_text: str | None) -> dict[
 
 # ── 유틸: LLM 호출 ───────────────────────────────────────────
 
-async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
+def _gemini_cooldown_ttl() -> int:
+    try:
+        ttl = feature_store.r.ttl(GEMINI_COOLDOWN_KEY)
+    except Exception:
+        return -2
+    return int(ttl or -2)
+
+
+def _gemini_available() -> bool:
+    return bool(GEMINI_API_KEY) and _gemini_cooldown_ttl() <= 0
+
+
+def _mark_gemini_cooldown(status_code: int) -> None:
+    if status_code != 429:
+        return
+    try:
+        feature_store.r.set(
+            GEMINI_COOLDOWN_KEY,
+            "quota_or_rate_limited",
+            ex=GEMINI_COOLDOWN_SECONDS,
+        )
+    except Exception:
+        pass
+    logging.warning("Gemini quota/rate limit detected. Cooling down for %s seconds.", GEMINI_COOLDOWN_SECONDS)
+
+
+async def _call_gemini(prompt: str, json_mode: bool = False, temperature: float | None = None) -> str:
     """Gemini Flash API 호출. GEMINI_API_KEY 미설정 시 빈 문자열 반환.
 
     json_mode=True이면 JSON 외 출력을 차단해 파싱 안정성을 높인다.
@@ -734,8 +1394,12 @@ async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
     logging.warning("[GEMINI CALL] %s", "".join(traceback.format_stack()[-4:-1]))
     if not GEMINI_API_KEY:
         return ""
+    cooldown_ttl = _gemini_cooldown_ttl()
+    if cooldown_ttl > 0:
+        logging.info("Skipping Gemini call during cooldown. ttl=%s", cooldown_ttl)
+        return ""
 
-    generation_config: dict = {"temperature": 0.7 if not json_mode else 0.1}
+    generation_config: dict = {"temperature": temperature if temperature is not None else (0.7 if not json_mode else 0.1)}
     if json_mode:
         generation_config["responseMimeType"] = "application/json"
 
@@ -747,8 +1411,31 @@ async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
                 "generationConfig": generation_config,
             },
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            _mark_gemini_cooldown(e.response.status_code)
+            raise
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _parse_gemini_reasons(llm_text: str, expected_count: int) -> list[str]:
+    payload = json.loads(llm_text)
+    raw_reasons = payload.get("reasons", [])
+    if not isinstance(raw_reasons, list):
+        logging.warning("Gemini reasons payload did not contain a list: %s", type(raw_reasons).__name__)
+        return []
+
+    reasons: list[str] = []
+    for raw_reason in raw_reasons[:expected_count]:
+        if isinstance(raw_reason, str):
+            reason = raw_reason
+        elif isinstance(raw_reason, dict):
+            reason = str(raw_reason.get("reason") or raw_reason.get("text") or "")
+        else:
+            reason = ""
+        reasons.append(" ".join(reason.split()))
+    return reasons
 
 
 def _coerce_interest_score(value: object) -> int:
@@ -777,7 +1464,7 @@ def _parse_query_interest_payload(payload: object) -> dict[str, int]:
 
 
 async def _infer_session_interest_from_query_llm(query_text: str) -> dict[str, int]:
-    if not GEMINI_API_KEY or not query_text.strip():
+    if not _gemini_available() or not query_text.strip():
         return {}
 
     category_list = ", ".join(QUERY_INTEREST_CATEGORIES)
@@ -826,6 +1513,8 @@ def _has_korean(text: str) -> bool:
 
 async def _translate_to_english(query: str) -> str:
     """한국어 패션 검색어를 영어로 번역. 실패 시 원문 반환."""
+    if not _gemini_available():
+        return query
     prompt = (
         f"Translate this Korean fashion search query to English. "
         f"Return only the translated English text, nothing else.\n\nQuery: {query}"
@@ -1046,6 +1735,45 @@ def _fallback_search_intent(query: str | None, translated_query: str | None = No
     }
 
 
+def _local_product_search_intent(query: str, constraints: dict[str, set[str]]) -> dict[str, object] | None:
+    if not constraints["products"]:
+        return None
+
+    sorted_products = sorted(
+        constraints["products"],
+        key=lambda product: PRODUCT_GROUP_PRIORITY.get(product, 0),
+        reverse=True,
+    )
+    product_terms: list[str] = []
+    for product in sorted_products:
+        product_terms.extend(PRODUCT_INTENT_TERMS.get(product, (PRODUCT_DISPLAY_LABELS.get(product, product),)))
+
+    color_terms: list[str] = []
+    for color in sorted(constraints["colors"]):
+        color_terms.extend(COLOR_INTENT_TERMS.get(color, color).split())
+
+    preferred_terms = _normalize_term_list(product_terms, SEARCH_INTENT_TERM_LIMIT)
+    avoid_terms: list[str] = []
+    for product in sorted_products:
+        avoid_terms.extend(PRODUCT_EXCLUDE_TERMS.get(product, ()))
+
+    base_terms = list(dict.fromkeys([*color_terms, *preferred_terms]))
+    translated_query = " ".join(base_terms) if base_terms else query
+    search_query = translated_query
+    if preferred_terms:
+        search_query = f"{translated_query}. Keywords: {' '.join(preferred_terms)}"
+
+    return {
+        "intent_label": query or "패션 검색",
+        "translated_query": translated_query,
+        "search_query": search_query,
+        "preferred_terms": preferred_terms,
+        "avoid_terms": _normalize_term_list(avoid_terms, SEARCH_INTENT_AVOID_LIMIT),
+        "session_interest": _infer_session_interest_from_query_keywords(query),
+        "source": "local_product_intent",
+    }
+
+
 def _parse_search_intent_payload(payload: object, query: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         return _fallback_search_intent(query)
@@ -1077,8 +1805,23 @@ async def _infer_search_intent(query: str | None) -> dict[str, object]:
     if not normalized_query:
         return _fallback_search_intent(query)
 
-    if not GEMINI_API_KEY:
-        return _fallback_search_intent(normalized_query)
+    local_constraints = _derive_query_constraints(normalized_query)
+    local_intent = _local_product_search_intent(normalized_query, local_constraints)
+    if local_intent is not None:
+        try:
+            feature_store.set_search_intent_cache(normalized_query, local_intent, fallback=True)
+        except Exception:
+            pass
+        return local_intent
+
+    cached_intent = feature_store.get_search_intent_cache(normalized_query)
+    if cached_intent is not None:
+        return cached_intent
+
+    if not _gemini_available():
+        fallback = _fallback_search_intent(normalized_query)
+        feature_store.set_search_intent_cache(normalized_query, fallback, fallback=True)
+        return fallback
 
     prompt = (
         "You are a fashion search intent parser for an H&M-like product catalog.\n"
@@ -1097,10 +1840,14 @@ async def _infer_search_intent(query: str | None) -> dict[str, object]:
     try:
         llm_text = await _call_gemini(prompt, json_mode=True)
         parsed = json.loads(llm_text)
-        return _parse_search_intent_payload(parsed, normalized_query)
+        intent = _parse_search_intent_payload(parsed, normalized_query)
+        feature_store.set_search_intent_cache(normalized_query, intent, fallback=False)
+        return intent
     except Exception:
         translated = await _translate_to_english(normalized_query) if _has_korean(normalized_query) else normalized_query
-        return _fallback_search_intent(normalized_query, translated_query=translated)
+        fallback = _fallback_search_intent(normalized_query, translated_query=translated)
+        feature_store.set_search_intent_cache(normalized_query, fallback, fallback=True)
+        return fallback
 
 
 def _text_for_intent_match(item: dict) -> str:
@@ -1141,14 +1888,18 @@ def _apply_search_intent_preferences(items: list[dict], intent: dict[str, object
     return adjusted
 
 
-RECOMMENDATION_REASON_FALLBACK_PREFIX = "Gemini 토큰 한도 제한으로 기본 추천 근거를 표시합니다."
+RECOMMENDATION_REASON_FALLBACK_PREFIX = "기본 추천 근거입니다."
 MODEL_REASON_LABELS = {
+    "query_intent_match": "검색어에 담긴 품목 의도와 직접 맞아서 우선 추천했습니다.",
+    "search_intent_match": "검색어 의도와 상품 카테고리가 잘 맞아서 추천했습니다.",
     "cold_start_popularity": "아직 클릭 데이터가 적어서 비슷한 사용자들에게 반응이 좋았던 인기 상품을 우선 추천했습니다.",
     "session_interest_match": "방금 설정한 관심사와 상품 카테고리가 잘 맞아서 추천했습니다.",
     "recent_click_similarity": "최근 클릭한 상품과 스타일이나 카테고리가 가까워서 함께 보기 좋은 후보입니다.",
     "ranking_score": "페르소나, 세션 관심사, 상품 특성을 종합했을 때 점수가 높게 나온 상품입니다.",
     "new_item_boost": "새로운 후보도 탐색할 수 있도록 노출한 상품입니다.",
     "bandit_reward_exploration": "최근 사용자 반응이 좋아지고 있어 탐색 후보로 함께 추천했습니다.",
+    "mab_exploration": "취향 범위를 넓히기 위해 탐색 후보로 함께 노출했습니다.",
+    "coverage_exploration": "비슷한 후보만 반복되지 않도록 다른 스타일 신호를 함께 반영했습니다.",
 }
 
 
@@ -1172,6 +1923,15 @@ def _fallback_recommendation_reason(item: dict, *, limited: bool = True) -> str:
     return f"{prefix}{base_reason}{detail}"
 
 
+def _attach_local_reason_text(item: dict, *, limited: bool = False) -> dict:
+    if item.get("reason_text"):
+        return item
+    enriched_item = {**item}
+    enriched_item["reason_text"] = _fallback_recommendation_reason(enriched_item, limited=limited)
+    enriched_item["reason_source"] = "local_reason_map"
+    return enriched_item
+
+
 def _enrich_search_results(items: list[dict]) -> list[dict]:
     enriched_results = []
     for item in items:
@@ -1188,6 +1948,7 @@ def _enrich_search_results(items: list[dict]) -> list[dict]:
             "product_type": meta.get("product_type", ""),
             "price": price,
             "price_estimated": price_estimated,
+            "price_source": _price_source_label(meta, price_estimated),
             "image_url": image_url_for_article(pid),
         })
     return enriched_results
@@ -1210,6 +1971,7 @@ def _enrich_recommendation_results(items: list[dict]) -> list[dict]:
             "product_type": meta.get("product_type", ""),
             "price": price,
             "price_estimated": price_estimated,
+            "price_source": _price_source_label(meta, price_estimated),
             "image_url": image_url_for_article(pid),
         })
     return enriched_results
@@ -1253,14 +2015,20 @@ async def search(req: SearchRequest):
 
     enriched_results = _enrich_search_results(result.get("results", []))
     if search_intent:
+        effective_constraints = search_constraints or _derive_query_constraints(req.query, search_intent.get("translated_query"))
         enriched_results = _apply_search_intent_preferences(enriched_results, search_intent)
+        enriched_results = _with_catalog_constraint_backfill(
+            enriched_results,
+            effective_constraints,
+            min_results=requested_top_k,
+        )
         enriched_results = _prioritize_query_constraint_matches(
             enriched_results,
-            search_constraints or _derive_query_constraints(req.query, search_intent.get("translated_query")),
+            effective_constraints,
         )
         enriched_results = _apply_query_product_labels(
             enriched_results,
-            search_constraints or _derive_query_constraints(req.query, search_intent.get("translated_query")),
+            effective_constraints,
         )
     result["results"] = enriched_results[:requested_top_k]
     result["total_count"] = len(result["results"])
@@ -1322,6 +2090,11 @@ async def personalized_search(req: PersonalizedSearchRequest):
     enriched_search_results = _enrich_search_results(search_result.get("results", []))
     if search_intent:
         enriched_search_results = _apply_search_intent_preferences(enriched_search_results, search_intent)
+        enriched_search_results = _with_catalog_constraint_backfill(
+            enriched_search_results,
+            search_constraints,
+            min_results=search_top_k,
+        )
         enriched_search_results = _prioritize_query_constraint_matches(
             enriched_search_results,
             search_constraints,
@@ -1395,6 +2168,10 @@ async def personalized_search(req: PersonalizedSearchRequest):
         top_n=top_n,
         personalization_weight=req.personalization_weight,
     )
+    personalized_results = [
+        _attach_local_reason_text(item, limited=False)
+        for item in personalized_results
+    ]
     pipeline_latency = personalized_result.get("pipeline_latency", {})
 
     response = {
@@ -1560,7 +2337,7 @@ async def recommend(
         pid = str(item.get("product_id", ""))
         meta = article_meta.get(pid, {})
         price, price_estimated = _display_price(meta, item)
-        enriched.append({
+        enriched_item = {
             **item,
             "rank": i,
             "name": meta.get("name") or pid,
@@ -1571,26 +2348,37 @@ async def recommend(
             "product_type": meta.get("product_type", ""),
             "price": price,
             "price_estimated": price_estimated,
+            "price_source": _price_source_label(meta, price_estimated),
             "image_url": image_url_for_article(pid),
-        })
+        }
+        enriched.append(_attach_local_reason_text(enriched_item, limited=False))
     result["recommendations"] = enriched
 
     # B: LLM 추천 이유 생성 (include_reasons=True이고 API 키 있을 때만)
     reasons_generated = False
-    if include_reasons and GEMINI_API_KEY:
+    if include_reasons and _gemini_available():
         items_desc = "\n".join(
-            f"{item['rank']}. {item['name']} ({item['category']}, {item['color']}, score={item.get('score', 0):.3f})"
+            f"{item['rank']}. {item['name']} | category={item['category']} | "
+            f"product_type={item['product_type']} | color={item['color']} | "
+            f"price={int(item.get('price') or 0):,}원 | reason_key={item.get('reason', '')} | "
+            f"score={item.get('score', 0):.3f}"
             for item in enriched
         )
         prompt = (
-            f"다음 패션 추천 상품들에 대해 각각 추천 이유를 한국어 1~2문장으로 작성해주세요.\n\n"
-            f"{items_desc}\n\n"
-            f"반드시 아래 JSON 형식으로만 응답하세요:\n"
-            f'{{\"reasons\": [\"이유1\", \"이유2\", ...]}}'
+            "패션 쇼핑 앱의 추천 이유를 한국어로 작성하세요.\n"
+            "상품마다 서로 다른 관점을 사용하세요: 검색 의도, 색감, 실루엣 인상, 활용 상황, 가격대, 취향 신호 중 하나를 골라 섞어 쓰세요.\n"
+            "모든 문장을 같은 구조로 시작하지 마세요. 특히 '이 상품은 ... 페르소나에게 어울리는' 식 반복을 피하세요.\n"
+            "상품 정보에 없는 소재, 핏, 기장, 브랜드 서사는 단정하지 마세요.\n"
+            "각 이유는 자연스러운 1~2문장, 90자 안팎으로 쓰세요.\n"
+            "입력 순서와 개수를 유지하고 reasons 배열만 반환하세요.\n\n"
+            f"사용자 페르소나: {persona_hint or result.get('persona') or '개인화'}\n"
+            f"검색어/맥락: {normalized_query_text or '최근 사용자 취향'}\n\n"
+            f"상품 목록:\n{items_desc}\n\n"
+            'JSON 형식: {"reasons":["이유1","이유2"]}'
         )
         try:
-            llm_text = await _call_gemini(prompt, json_mode=True)
-            reasons = json.loads(llm_text).get("reasons", [])
+            llm_text = await _call_gemini(prompt, json_mode=True, temperature=0.55)
+            reasons = _parse_gemini_reasons(llm_text, len(result["recommendations"]))
             for i, item in enumerate(result["recommendations"]):
                 item["reason_text"] = reasons[i] if i < len(reasons) else ""
                 item["reason_source"] = "gemini" if item["reason_text"] else "model"
@@ -1633,31 +2421,51 @@ async def explain_results(req: ExplainResultsRequest):
             "product_type": meta.get("product_type", ""),
             "price": price,
             "price_estimated": price_estimated,
+            "price_source": _price_source_label(meta, price_estimated),
         })
 
-    if GEMINI_API_KEY:
+    target_label = {
+        "all": "전체 고객",
+        "women": "여성 고객",
+        "men": "남성 고객",
+        "kids": "키즈 고객",
+    }.get(_normalize_target_audience(req.target_audience), "전체 고객")
+
+    if _gemini_available():
         items_desc = "\n".join(
             f"{item['rank']}. id={item['id']} | {item['name']} | "
-            f"{item['category']} / {item['product_type']} / {item['color']} | {item['brand']}"
+            f"category={item['category']} | product_type={item['product_type']} | "
+            f"color={item['color']} | brand={item['brand']} | "
+            f"price={int(item['price']):,}원 | price_source={item['price_source']}"
             for item in enriched_items
         )
         prompt = (
-            "현재 화면에 표시된 패션 검색 결과 각각에 대해 추천 이유를 한국어로 작성하세요.\n"
-            "각 이유는 2문장으로 작성하고, 너무 일반적인 'A가 B와 매칭' 식 표현은 피하세요.\n"
-            "반드시 상품의 카테고리, 색상, 가격대, 검색어 의도, 페르소나/쇼핑 대상을 연결해 설명하세요.\n"
-            "새 상품을 만들거나 순서를 바꾸지 말고, 입력된 상품 수와 같은 개수의 reasons 배열만 반환하세요.\n\n"
+            "패션 검색 결과 카드에 들어갈 추천 이유를 한국어로 작성하세요.\n"
+            "각 상품마다 다른 관점을 선택해 자연스럽게 설명하세요: 검색어와의 연결, 색감, 카테고리 적합성, 가격대, 코디 활용 상황, 취향 신호.\n"
+            "모든 이유를 같은 문장 구조로 시작하지 마세요. '이 상품은 ... 페르소나에게 어울리는' 같은 반복 표현은 금지합니다.\n"
+            "상품 정보에 없는 소재, 핏, 기장, 디자인 특징은 단정하지 마세요.\n"
+            "각 이유는 1~2문장으로 쓰되, 사람에게 말하듯 구체적이고 덜 템플릿처럼 작성하세요.\n"
+            "입력된 상품 수와 같은 개수의 reasons 배열만 반환하세요.\n\n"
             f"검색어: {req.query or '없음'}\n"
             f"페르소나: {req.persona or '개인화'}\n\n"
-            f"쇼핑 대상: {_normalize_target_audience(req.target_audience)}\n\n"
+            f"쇼핑 대상: {target_label}\n\n"
             f"상품 목록:\n{items_desc}\n\n"
             'JSON 형식: {"reasons":["이유1","이유2"]}'
         )
         try:
-            llm_text = await _call_gemini(prompt, json_mode=True)
-            reasons = json.loads(llm_text).get("reasons", [])
+            llm_text = await _call_gemini(prompt, json_mode=True, temperature=0.6)
+            reasons = _parse_gemini_reasons(llm_text, len(enriched_items))
+            if sum(1 for reason in reasons if reason) < len(enriched_items):
+                logging.info(
+                    "Gemini returned partial result explanations: expected=%d got=%d",
+                    len(enriched_items),
+                    sum(1 for reason in reasons if reason),
+                )
         except Exception:
+            logging.exception("Gemini result explanations failed. Using local fallback reasons.")
             reasons = []
     else:
+        logging.info("Gemini unavailable for result explanations. Using local fallback reasons.")
         reasons = []
 
     explanations = []
@@ -1666,19 +2474,15 @@ async def explain_results(req: ExplainResultsRequest):
         color = item["color"] or "기본 색상"
         price_label = f"{int(item['price']):,}원대"
         estimated_note = "추정 가격 기준으로도 " if item.get("price_estimated") else ""
-        target_label = {
-            "all": "전체 고객",
-            "women": "여성 고객",
-            "men": "남성 고객",
-            "kids": "키즈 고객",
-        }.get(_normalize_target_audience(req.target_audience), "전체 고객")
         fallback = (
             f"{item['name']}은 {color} 계열의 {category}라서 '{req.query or '현재 검색'}'에서 보인 색상과 품목 의도에 직접 맞습니다. "
             f"{estimated_note}{price_label}로 예산형 조합에 넣기 쉽고, {target_label} 기준의 현재 페르소나 선호와도 무난하게 연결됩니다."
         )
+        reason = reasons[index] if index < len(reasons) and reasons[index] else fallback
         explanations.append({
             "id": item["id"],
-            "reason": reasons[index] if index < len(reasons) and reasons[index] else fallback,
+            "reason": reason,
+            "reason_source": "gemini" if index < len(reasons) and reasons[index] else "local_fallback",
         })
 
     return {"items": explanations}
@@ -1785,7 +2589,7 @@ async def onboarding(req: OnboardingRequest):
         feature_store.r.set(f"onboarding_scores:{req.user_id}", json.dumps(cached_result["persona_scores"]), ex=600)
         return cached_result
 
-    if GEMINI_API_KEY:
+    if _gemini_available():
         try:
             llm_text = await _call_gemini(prompt, json_mode=True)
             normalized = _normalize_persona_scores(json.loads(llm_text))
@@ -1908,7 +2712,7 @@ async def budget_set(
         if query and query.strip():
             translated_query: str | None = None
             search_query = query.strip()
-            if _has_korean(search_query) and GEMINI_API_KEY:
+            if _has_korean(search_query) and _gemini_available():
                 translated_query = await _translate_to_english(search_query)
                 search_query = translated_query
 
