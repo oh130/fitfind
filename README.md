@@ -58,9 +58,9 @@
 │           API Gateway  :8000            │
 │                                         │
 │  POST /api/search                       │
-│  GET  /api/recommend                    │
+│  GET  /api/recommend                    ├────► Dashboard :8501  (Streamlit)
 │  POST /api/set-recommend                │
-│  POST /api/onboarding                   │
+│  POST /api/onboarding                   ├────► Simulator        (→ Redis)
 │  POST /api/events                       │
 └──────────┬───────────────────┬──────────┘
            │                   │
@@ -75,26 +75,20 @@
 │                  │  │  e-Greedy MAB       │
 └──────────────────┘  └────────┬────────────┘
                                │
-                    ┌──────────▼───────────┐
+                               ▼
+                    ┌──────────────────────┐
                     │    Redis  :6379      │
                     │   Feature Store      │
                     │  recent_clicks       │
                     │  session_interest    │
                     │  persona_profile     │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │     CT Pipeline      │
+                    │  monitor + retrain   │
                     └──────────────────────┘
-
-┌─────────────────────┐  ┌──────────────────────┐
-│  Dashboard  :8501   │  │      Simulator       │
-│  Streamlit          │  │  auto event logging  │
-│  search metrics     │  │  search/view/cart    │
-│  rec metrics        │  │  purchase events     │
-│  A/B test results   │  └──────────────────────┘
-└─────────────────────┘
-
-┌──────────────────────┐
-│     CT Pipeline      │
-│  monitor + retrain   │
-└──────────────────────┘
 ```
 
 | 서비스 | 주소 |
