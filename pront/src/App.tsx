@@ -32,6 +32,7 @@ type UploadedImage = {
   name: string;
   sizeLabel: string;
   base64: string;
+  previewUrl: string;
 };
 
 const onboardingStyleOptions = ["casual", "minimal", "street", "sporty", "feminine", "classic"];
@@ -118,6 +119,7 @@ function App() {
   const [isSubmittingPersona, setIsSubmittingPersona] = useState(false);
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const isManagingHistoryRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const budgetLabel = `${Number(budget || 0).toLocaleString("ko-KR")}원`;
 
@@ -179,11 +181,19 @@ function App() {
     setHasSearched(false);
   };
 
+  const clearUploadedImage = () => {
+    setUploadedImage(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    clearSearchResults();
+    setSearchMode((currentMode) => (currentMode === "image" ? "text" : currentMode));
+  };
+
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) {
-      setUploadedImage(null);
-      clearSearchResults();
+      clearUploadedImage();
       return;
     }
 
@@ -197,6 +207,7 @@ function App() {
         name: file.name,
         sizeLabel: `${sizeInMb.toFixed(2)}MB`,
         base64,
+        previewUrl: result,
       });
       clearSearchResults();
 
@@ -699,7 +710,7 @@ function App() {
 
             <div className="composer-grid">
               <label className="upload-tile upload-label">
-                <input type="file" accept="image/*" onChange={handleFileChange} />
+                <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} />
                 <p>이미지 업로드</p>
                 <span>
                   {uploadedImage
@@ -713,6 +724,27 @@ function App() {
                 <span>{helperMessage}</span>
               </div>
             </div>
+
+            {uploadedImage ? (
+              <div className="image-preview-card">
+                <div className="image-preview-copy">
+                  <div>
+                    <p className="eyebrow">Selected Image</p>
+                    <strong>{uploadedImage.name}</strong>
+                  </div>
+                  <button type="button" className="mini-button" onClick={clearUploadedImage}>
+                    업로드 취소
+                  </button>
+                </div>
+                <div className="image-preview-frame">
+                  <img
+                    src={uploadedImage.previewUrl}
+                    alt={uploadedImage.name}
+                    className="image-preview"
+                  />
+                </div>
+              </div>
+            ) : null}
 
             <div className="signal-list">
               <div className="signal-chip">
