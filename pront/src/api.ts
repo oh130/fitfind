@@ -57,6 +57,9 @@ export type BudgetSetItem = {
   brand: string;
   price: string;
   score: number;
+  itemScore: number;
+  setScore: number;
+  setTotalPrice?: number;
   category: string;
   accent: string;
   imageUrl?: string;
@@ -184,6 +187,9 @@ type ApiBudgetSetItem = {
   price_int?: number;
   price_estimated?: boolean;
   score?: number;
+  item_score?: number;
+  set_score?: number;
+  set_total_price?: number;
   category?: string;
   image_url?: string;
   imageUrl?: string;
@@ -342,6 +348,11 @@ function toRelativeScores(rawScores: number[]): number[] {
   return shiftedScores.map((score) => Math.max(0, Math.min(1, score / maxScore)));
 }
 
+function toUnitScore(value: unknown, fallback: number): number {
+  const score = toFiniteScore(value, fallback);
+  return Math.max(0, Math.min(1, score));
+}
+
 function normalizeRecommendationBundle(
   payload: ApiRecommendationResponse,
   topN: number,
@@ -444,16 +455,15 @@ function normalizePersonalizedSearchItems(
 function normalizeBudgetSetBundle(payload: ApiBudgetSetResponse): BudgetSetBundle {
   const sets = (payload.sets ?? []).map((setItems, setIndex) =>
     {
-      const relativeScores = toRelativeScores(
-        setItems.map((item, itemIndex) => toFiniteScore(item.score, Math.max(0.5, 0.9 - itemIndex * 0.08))),
-      );
-
       return setItems.map((item, itemIndex) => ({
         id: toNumericId(item.id, item.article_id, item.product_id),
         title: cleanDisplayText(item.title ?? item.name, `Set Item ${itemIndex + 1}`),
         brand: cleanDisplayText(item.brand, "Unknown Brand"),
         price: toCurrencyLabel(item.price_int ?? item.price, item.price_estimated),
-        score: relativeScores[itemIndex] ?? Math.max(0.5, 0.9 - itemIndex * 0.08),
+        score: toUnitScore(item.set_score ?? item.score, Math.max(0.5, 0.9 - itemIndex * 0.08)),
+        setScore: toUnitScore(item.set_score ?? item.score, Math.max(0.5, 0.9 - itemIndex * 0.08)),
+        itemScore: toUnitScore(item.item_score ?? item.score, Math.max(0.5, 0.9 - itemIndex * 0.08)),
+        setTotalPrice: typeof item.set_total_price === "number" ? item.set_total_price : undefined,
         category: item.category ?? "Unknown Category",
         accent:
           recommendationFallbackPalette[(setIndex + itemIndex) % recommendationFallbackPalette.length],

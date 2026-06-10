@@ -44,6 +44,12 @@ const targetAudienceOptions: Array<{ key: TargetAudience; label: string }> = [
   { key: "kids", label: "키즈" },
 ];
 
+const flowSteps: Array<{ key: AppView; label: string; title: string }> = [
+  { key: "landing", label: "01", title: "시작" },
+  { key: "onboarding", label: "02", title: "취향 설정" },
+  { key: "search", label: "03", title: "상품 검색" },
+];
+
 const emptyBudgetSetBundle: BudgetSetBundle = {
   budget: 0,
   setCount: 0,
@@ -85,6 +91,17 @@ function toDisplayPercent(value: number): string {
   const normalizedValue = value > 1 ? value / 100 : value;
   const clampedValue = Math.max(0, Math.min(1, normalizedValue));
   return `${(clampedValue * 100).toFixed(1)}%`;
+}
+
+function parseWonAmount(value: string | number | undefined): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : 0;
+  }
+  return Number(String(value ?? "").replace(/[^0-9]/g, "") || 0);
+}
+
+function formatWonAmount(value: number): string {
+  return `${Math.max(0, Math.round(value)).toLocaleString("ko-KR")}원`;
 }
 
 function App() {
@@ -427,400 +444,480 @@ function App() {
   const activeSearchResults = searchResultView === "personalized" ? personalizedResults : results;
   const activeSearchLatency = searchResultView === "personalized" ? personalizedLatency : activeLatency;
   const activeSearchScoreLabel = searchResultView === "personalized" ? "추천 점수" : "유사도";
-  const mergedSearchResults = hasPersonalizedSearchResults ? personalizedResults : activeSearchResults;
-  const mergedSearchLatency = hasPersonalizedSearchResults ? personalizedLatency : activeSearchLatency;
-  const mergedSearchScoreLabel = hasPersonalizedSearchResults ? "추천 점수" : activeSearchScoreLabel;
+  const mergedSearchResults =
+    activeSearchResults.length > 0
+      ? activeSearchResults
+      : hasPersonalizedSearchResults
+        ? personalizedResults
+        : results;
+  const mergedSearchLatency =
+    activeSearchResults.length > 0
+      ? activeSearchLatency
+      : hasPersonalizedSearchResults
+        ? personalizedLatency
+        : activeLatency;
+  const mergedSearchScoreLabel =
+    activeSearchResults.length > 0
+      ? activeSearchScoreLabel
+      : hasPersonalizedSearchResults
+        ? "추천 점수"
+        : "유사도";
+  const selectedAudienceLabel =
+    targetAudienceOptions.find((option) => option.key === targetAudience)?.label ?? "전체";
+  const parsedBudget = parseWonAmount(budget);
   const searchEmptyMessage = !hasSearched
-    ? "검색을 실행하면 유사도순 결과와 내 취향순 결과가 여기에 표시됩니다."
+    ? "찾고 싶은 스타일을 입력하면 어울리는 상품을 골라 보여드릴게요."
     : searchError
       ? searchError
       : searchResultView === "personalized"
-        ? "검색 후보 안에서 개인화된 결과가 아직 없습니다. 검색을 다시 시도해 주세요."
-        : "검색 결과가 없습니다. 검색어를 조금 더 구체적으로 바꿔 보세요.";
+        ? "취향에 맞는 결과가 아직 없습니다. 검색어를 조금 더 구체적으로 바꿔 보세요."
+        : "검색 결과가 없습니다. 이미지나 색상, 카테고리를 함께 입력해 보세요.";
 
   if (view === "landing") {
     return (
-      <div className="app-shell landing-shell">
-        <section className="landing-panel">
-          <h1>Fit-Find</h1>
-          <p className="landing-description">
-            멀티모달 검색과 개인화 추천을 결합한 패션 탐색 서비스.
-          </p>
-          <div className="landing-actions">
-            <button type="button" className="primary-button landing-start-button" onClick={goToOnboarding}>
-              시작하기
+      <div className="studio-shell flow-shell">
+        <aside className="studio-sidebar flow-sidebar">
+          <div className="studio-brand">
+            <div>
+              <span>FitFind</span>
+              <strong>AI 패션 탐색</strong>
+            </div>
+            <button type="button" onClick={goToOnboarding}>
+              시작
             </button>
           </div>
-        </section>
+
+          <div className="flow-steps" aria-label="서비스 진행 단계">
+            {flowSteps.map((step) => (
+              <div key={step.key} className={step.key === "landing" ? "flow-step active" : "flow-step"}>
+                <span>{step.label}</span>
+                <strong>{step.title}</strong>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        <main className="flow-main">
+          <section className="flow-hero">
+            <p className="studio-kicker">Capstone Demo</p>
+            <h1>텍스트와 이미지로 찾고, 취향과 예산으로 좁힙니다.</h1>
+            <p>
+              FitFind는 멀티모달 검색, 페르소나 기반 개인화, 예산 코디 추천을 하나의 흐름으로
+              연결한 패션 탐색 서비스입니다.
+            </p>
+            <div className="flow-action-row">
+              <button type="button" className="studio-primary-action" onClick={goToOnboarding}>
+                취향 설정 시작
+              </button>
+              <button type="button" className="studio-secondary-action" onClick={() => setView("search")}>
+                바로 검색하기
+              </button>
+            </div>
+          </section>
+
+          <section className="flow-feature-grid">
+            <article>
+              <span>Search</span>
+              <strong>텍스트 + 이미지</strong>
+              <p>문장과 이미지 신호를 함께 사용해 유사 상품을 찾습니다.</p>
+            </article>
+            <article>
+              <span>Persona</span>
+              <strong>취향 반영</strong>
+              <p>온보딩 결과와 세션 행동을 추천 결과에 반영합니다.</p>
+            </article>
+            <article>
+              <span>Budget</span>
+              <strong>코디 세트</strong>
+              <p>예산 안에서 실제 착용 가능한 아이템 조합을 구성합니다.</p>
+            </article>
+          </section>
+        </main>
       </div>
     );
   }
 
   if (view === "onboarding") {
     return (
-      <div className="app-shell onboarding-shell">
-        <section className="onboarding-panel">
-          <div className="onboarding-copy">
-            <p className="eyebrow">Personalization Setup</p>
-            <h1>개인화 추천을 위한 페르소나 설정</h1>
-            <p>취향 정보를 바탕으로 추천 결과를 맞춤 설정합니다.</p>
-          </div>
-
-          <div className="search-composer">
-            <div className="target-audience-panel">
-              <span>쇼핑 대상</span>
-              <div className="target-audience-buttons" role="group" aria-label="쇼핑 대상 선택">
-                {targetAudienceOptions.map((option) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    className={targetAudience === option.key ? "mini-button active" : "mini-button"}
-                    onClick={() => setTargetAudience(option.key)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
+      <div className="studio-shell flow-shell">
+        <aside className="studio-sidebar flow-sidebar">
+          <div className="studio-brand">
+            <div>
+              <span>FitFind</span>
+              <strong>{userId.trim() || "anonymous"}</strong>
             </div>
-
-            <label className="user-id-field">
-              <span>User ID</span>
-              <input
-                value={userId}
-                onChange={(event) => setUserId(event.target.value)}
-                placeholder="예: user_1024"
-                aria-label="온보딩 사용자 ID"
-              />
-            </label>
-
-            <label className="search-box">
-              <span>취향 입력</span>
-              <input
-                value={onboardingDescription}
-                onChange={(event) => setOnboardingDescription(event.target.value)}
-                placeholder="예: 미니멀한 블랙 아우터와 실용적인 출근룩을 자주 입습니다."
-                aria-label="온보딩 취향 입력"
-              />
-            </label>
-
-            <div className="signal-list">
-              {onboardingStyleOptions.map((style) => (
-                <button
-                  key={style}
-                  type="button"
-                  className={selectedStyles.includes(style) ? "mini-button active" : "mini-button"}
-                  onClick={() => toggleStyleChoice(style)}
-                >
-                  {style}
-                </button>
-              ))}
-            </div>
-
-            <div className="recommendation-toolbar">
-              <div className="recommendation-actions">
-                <button type="button" className="mini-button" onClick={() => setView("landing")}>
-                  이전
-                </button>
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={runOnboardingAnalysis}
-                  disabled={isAnalyzingOnboarding}
-                >
-                  {isAnalyzingOnboarding ? "분석 중..." : "취향 분석하기"}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {Object.keys(personaScores).length > 0 ? (
-            <div className="persona-grid">
-              {personaOptions.map((persona) => (
-                <article
-                  key={persona.key}
-                  className={
-                    persona.key === selectedOnboardingPersona ? "persona-option active" : "persona-option"
-                  }
-                >
-                  <p className="persona-name">{persona.name}</p>
-                  <h2>{persona.title}</h2>
-                  <p className="persona-summary">{persona.summary}</p>
-                  <div className="persona-score-row">
-                    <strong>{personaScores[persona.key] ?? 0}%</strong>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={personaScores[persona.key] ?? 0}
-                      onChange={(event) => updatePersonaScore(persona.key, Number(event.target.value))}
-                      aria-label={`${persona.name} 비율 조절`}
-                    />
-                  </div>
-                  <div className="persona-traits">
-                    {persona.traits.map((trait) => (
-                      <span key={trait} className="badge">
-                        {trait}
-                      </span>
-                    ))}
-                  </div>
-                </article>
-              ))}
-            </div>
-          ) : null}
-
-          <div className="onboarding-footer">
-            <div className="persona-card">
-              <span>총합 점수</span>
-              <strong>{personaScoreTotal}%</strong>
-            </div>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={startWithPersona}
-              disabled={
-                isSubmittingPersona || Object.keys(personaScores).length === 0 || !isPersonaScoreTotalValid
-              }
-            >
-              {isSubmittingPersona ? "저장 중..." : "검색 페이지로 이동"}
+            <button type="button" onClick={() => setView("landing")}>
+              처음
             </button>
           </div>
 
-          {Object.keys(personaScores).length > 0 ? (
-            <p className="persona-adjustment-note">
-              슬라이더를 조정하면서 원하는 비중으로 맞춰 보세요.
-              {!isPersonaScoreTotalValid ? " 전체 합계가 100%가 되어야 다음 단계로 진행할 수 있습니다." : ""}
-            </p>
-          ) : null}
+          <div className="flow-steps" aria-label="서비스 진행 단계">
+            {flowSteps.map((step) => (
+              <div key={step.key} className={step.key === "onboarding" ? "flow-step active" : "flow-step"}>
+                <span>{step.label}</span>
+                <strong>{step.title}</strong>
+              </div>
+            ))}
+          </div>
+        </aside>
 
-          {onboardingError ? <p className="status-text">{onboardingError}</p> : null}
-        </section>
+        <main className="flow-main onboarding-studio-main">
+          <section className="setup-board">
+            <header className="setup-header">
+              <div>
+                <span className="studio-kicker">Persona Setup</span>
+                <h1>취향을 먼저 잡고 검색으로 넘어갑니다.</h1>
+              </div>
+              <div className="setup-total">
+                <span>총합</span>
+                <strong>{personaScoreTotal}%</strong>
+              </div>
+            </header>
+
+            <div className="setup-content">
+              <div className="setup-form">
+                <div className="setup-segmented" role="group" aria-label="쇼핑 대상 선택">
+                  {targetAudienceOptions.map((option) => (
+                    <button
+                      key={option.key}
+                      type="button"
+                      className={targetAudience === option.key ? "active" : ""}
+                      onClick={() => setTargetAudience(option.key)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+
+                <label>
+                  <span>User ID</span>
+                  <input
+                    value={userId}
+                    onChange={(event) => setUserId(event.target.value)}
+                    placeholder="user_1024"
+                    aria-label="온보딩 사용자 ID"
+                  />
+                </label>
+
+                <label>
+                  <span>Style note</span>
+                  <input
+                    value={onboardingDescription}
+                    onChange={(event) => setOnboardingDescription(event.target.value)}
+                    placeholder="미니멀한 블랙 아우터와 실용적인 출근룩"
+                    aria-label="온보딩 취향 입력"
+                  />
+                </label>
+
+                <div className="style-chip-grid">
+                  {onboardingStyleOptions.map((style) => (
+                    <button
+                      key={style}
+                      type="button"
+                      className={selectedStyles.includes(style) ? "active" : ""}
+                      onClick={() => toggleStyleChoice(style)}
+                    >
+                      {style}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="setup-actions">
+                  <button type="button" onClick={() => setView("landing")}>
+                    이전
+                  </button>
+                  <button type="button" className="primary" onClick={runOnboardingAnalysis} disabled={isAnalyzingOnboarding}>
+                    {isAnalyzingOnboarding ? "분석 중" : "취향 분석"}
+                  </button>
+                </div>
+
+                {onboardingError ? <p className="studio-alert light">{onboardingError}</p> : null}
+              </div>
+
+              <div className="setup-guide">
+                <span>Next</span>
+                <strong>분석 결과를 확인한 뒤 비중을 조절하세요.</strong>
+                <p>
+                  합계가 100%가 되면 개인화 검색에 사용할 페르소나 프로필로 저장할 수 있습니다.
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section className="persona-board">
+            <header className="studio-board-header compact">
+              <div>
+                <span className="studio-kicker">Persona Mix</span>
+                <h2>{Object.keys(personaScores).length > 0 ? "분석된 취향 비중" : "분석 대기 중"}</h2>
+              </div>
+              <button
+                type="button"
+                className="studio-primary-action small"
+                onClick={startWithPersona}
+                disabled={
+                  isSubmittingPersona || Object.keys(personaScores).length === 0 || !isPersonaScoreTotalValid
+                }
+              >
+                {isSubmittingPersona ? "저장 중" : "검색으로 이동"}
+              </button>
+            </header>
+
+            {Object.keys(personaScores).length > 0 ? (
+              <>
+                <div className="persona-studio-grid">
+                  {personaOptions.map((persona) => (
+                    <article
+                      key={persona.key}
+                      className={
+                        persona.key === selectedOnboardingPersona ? "persona-studio-card active" : "persona-studio-card"
+                      }
+                    >
+                      <div className="persona-studio-card-head">
+                        <span>{persona.name}</span>
+                        <strong>{personaScores[persona.key] ?? 0}%</strong>
+                      </div>
+                      <h3>{persona.title}</h3>
+                      <p>{persona.summary}</p>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={personaScores[persona.key] ?? 0}
+                        onChange={(event) => updatePersonaScore(persona.key, Number(event.target.value))}
+                        aria-label={`${persona.name} 비율 조절`}
+                      />
+                      <div>
+                        {persona.traits.map((trait) => (
+                          <span key={trait}>{trait}</span>
+                        ))}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <p className="persona-adjustment-note studio-note">
+                  {!isPersonaScoreTotalValid
+                    ? "전체 합계가 100%가 되어야 검색 페이지로 이동할 수 있습니다."
+                    : "설정이 준비됐습니다. 검색 페이지로 이동해 개인화 결과를 확인하세요."}
+                </p>
+              </>
+            ) : (
+              <div className="studio-empty compact">
+                <p>취향 설명을 입력하고 분석을 실행하세요.</p>
+              </div>
+            )}
+          </section>
+        </main>
       </div>
     );
   }
 
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">Fit-Find</p>
-          <h1>Fit-Find: 취향 기반 멀티모달 패션 검색 및 추천</h1>
-        </div>
-        <div className="topbar-meta">
-          <span>현재 사용자: {userId}</span>
-          <button type="button" className="mini-button" onClick={() => setView("onboarding")}>
-            페르소나 다시 정하기
+    <div className="studio-shell">
+      <aside className="studio-sidebar">
+        <div className="studio-brand">
+          <div>
+            <span>FitFind</span>
+            <strong>{userId.trim() || "anonymous"}</strong>
+          </div>
+          <button type="button" onClick={() => setView("onboarding")}>
+            취향 설정
           </button>
         </div>
-      </header>
 
-      <main className="layout">
-        <section className="hero-panel">
-          <div className="hero-copy">
-            <p className="eyebrow">Search Experience</p>
-            <h2>검색 입력</h2>
-
-            <div className="panel weight-panel">
-              <div className="weight-copy">
-                <p className="eyebrow">Result Balance</p>
-                <h4>추천 반영도</h4>
-              </div>
-              <div className="weight-control">
-                <div className="weight-labels">
-                  <span>검색어 중심</span>
-                  <span>취향 반영</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  step="5"
-                  value={Math.round(recommendationWeight * 100)}
-                  onChange={(event) => {
-                    setRecommendationWeight(Number(event.target.value) / 100);
-                    clearSearchResults();
-                  }}
-                  aria-label="추천 반영도"
-                />
-              </div>
+        <div className="flow-steps compact" aria-label="서비스 진행 단계">
+          {flowSteps.map((step) => (
+            <div key={step.key} className={step.key === "search" ? "flow-step active" : "flow-step"}>
+              <span>{step.label}</span>
+              <strong>{step.title}</strong>
             </div>
+          ))}
+        </div>
 
-            <div className="search-actions">
-              <button type="submit" form="search-composer-form" className="primary-button" disabled={isSearching}>
-                {isSearching ? "검색 중..." : "검색 실행"}
-              </button>
+        <form id="search-composer-form" className="studio-form" onSubmit={handleSubmit}>
+          <label className="studio-query">
+            <span>Query</span>
+            <input
+              value={query}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                clearSearchResults();
+              }}
+              placeholder="블랙 아우터와 슬림 팬츠"
+              aria-label="텍스트 검색어"
+            />
+          </label>
+
+          <div className="studio-segmented" role="group" aria-label="쇼핑 대상 선택">
+            {targetAudienceOptions.map((option) => (
               <button
+                key={option.key}
                 type="button"
-                className="primary-button"
-                onClick={loadAiRecommendations}
-                disabled={isRefreshingRecommendations}
+                className={targetAudience === option.key ? "active" : ""}
+                onClick={() => {
+                  setTargetAudience(option.key);
+                  clearSearchResults();
+                }}
               >
-                {isRefreshingRecommendations ? "AI 추천 이유 불러오는 중..." : "AI 추천 이유"}
+                {option.label}
               </button>
-            </div>
-            <p className="search-hint">텍스트만, 이미지만, 또는 둘을 함께 사용해 검색할 수 있습니다.</p>
-            {recommendationError ? <p className="status-text">{recommendationError}</p> : null}
+            ))}
           </div>
 
-          <form id="search-composer-form" className="search-composer" onSubmit={handleSubmit}>
-            <div className="search-tabs" aria-label="검색 모드">
-              <button
-                type="button"
-                className={searchMode === "text" ? "active" : ""}
-                onClick={() => {
-                  setSearchMode("text");
-                  clearSearchResults();
-                }}
-              >
-                텍스트
-              </button>
-              <button
-                type="button"
-                className={searchMode === "image" ? "active" : ""}
-                onClick={() => {
-                  setSearchMode("image");
-                  clearSearchResults();
-                }}
-              >
-                이미지
-              </button>
-              <button
-                type="button"
-                className={searchMode === "multimodal" ? "active" : ""}
-                onClick={() => {
-                  setSearchMode("multimodal");
-                  clearSearchResults();
-                }}
-              >
-                텍스트 + 이미지
-              </button>
-            </div>
+          <label className={uploadedImage ? "studio-upload has-image" : "studio-upload"}>
+            <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} />
+            {uploadedImage ? (
+              <>
+                <img src={uploadedImage.previewUrl} alt={uploadedImage.name} />
+                <span>{uploadedImage.name}</span>
+              </>
+            ) : (
+              <>
+                <strong>이미지 추가</strong>
+                <span>사진 없이 검색 가능</span>
+              </>
+            )}
+          </label>
+          {uploadedImage ? (
+            <button type="button" className="studio-link-button" onClick={clearUploadedImage}>
+              이미지 제거
+            </button>
+          ) : null}
 
-            <label className="search-box">
-              <span>텍스트 검색어</span>
+          <div className="studio-field-grid">
+            <label>
+              <span>User</span>
               <input
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value);
-                  clearSearchResults();
-                }}
-                placeholder="예: 광택감 있는 블랙 아우터와 슬림 팬츠 조합"
-                aria-label="텍스트 검색어"
+                value={userId}
+                onChange={(event) => setUserId(event.target.value)}
+                placeholder="user_1024"
+                aria-label="사용자 ID"
               />
             </label>
-
-            <div className="composer-grid">
-              <label className="upload-tile upload-label">
-                <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} />
-                <p>이미지 업로드</p>
-                <span>
-                  {uploadedImage
-                    ? `${uploadedImage.name} · ${uploadedImage.sizeLabel}`
-                    : "착장 사진, 스크린샷, 무드보드 이미지를 올려 보세요."}
-                </span>
-              </label>
-
-              <div className="context-tile">
-                <p>현재 검색 상태</p>
-                <span>{helperMessage}</span>
-              </div>
-            </div>
-
-            {uploadedImage ? (
-              <div className="image-preview-card">
-                <div className="image-preview-copy">
-                  <div>
-                    <p className="eyebrow">Selected Image</p>
-                    <strong>{uploadedImage.name}</strong>
-                  </div>
-                  <button type="button" className="mini-button" onClick={clearUploadedImage}>
-                    업로드 취소
-                  </button>
-                </div>
-                <div className="image-preview-frame">
-                  <img
-                    src={uploadedImage.previewUrl}
-                    alt={uploadedImage.name}
-                    className="image-preview"
-                  />
-                </div>
-              </div>
-            ) : null}
-
-            <div className="signal-list">
-              <div className="signal-chip">
-                <strong>입력 텍스트</strong>
-                <span>{query.trim() || "텍스트 없이 이미지 기반 검색만 대기 중입니다."}</span>
-              </div>
-              <div className="signal-chip">
-                <strong>업로드 이미지</strong>
-                <span>{uploadedImage ? uploadedImage.name : "아직 업로드된 이미지가 없습니다."}</span>
-              </div>
-              <div className="signal-chip">
-                <strong>실행 모드</strong>
-                <span>{modeLabel}</span>
-              </div>
-            </div>
-          </form>
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">Search Results</p>
-              <h3>{hasSearched ? "검색과 추천을 함께 반영한 결과" : "검색 결과"}</h3>
-            </div>
-            <div className="heading-metrics">
-              <span className="metric">응답 시간 {mergedSearchLatency}</span>
-              <span className="metric">결과 수 {mergedSearchResults.length}</span>
-            </div>
+            <label>
+              <span>Budget</span>
+              <input
+                type="number"
+                min="0"
+                step="1000"
+                value={budget}
+                onChange={(event) => setBudget(event.target.value)}
+                placeholder="200000"
+                aria-label="예산"
+              />
+            </label>
           </div>
 
-          <div className="recommendation-toolbar">
-            <div className="recommendation-actions">
-              <div className="topn-group" role="group" aria-label="Top N 검색 결과 개수">
-                {[3, 5, 10].map((count) => (
-                  <button
-                    key={count}
-                    type="button"
-                    className={topN === count ? "mini-button active" : "mini-button"}
-                    onClick={() => {
-                      setTopN(count);
-                      clearSearchResults();
-                    }}
-                  >
-                    Top {count}
-                  </button>
-                ))}
-              </div>
+          <div className="studio-range">
+            <div>
+              <span>Preference</span>
+              <strong>{Math.round(recommendationWeight * 100)}%</strong>
             </div>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              value={Math.round(recommendationWeight * 100)}
+              onChange={(event) => {
+                setRecommendationWeight(Number(event.target.value) / 100);
+                clearSearchResults();
+              }}
+              aria-label="추천 반영도"
+            />
+          </div>
+
+          <div className="studio-count-row" role="group" aria-label="검색 결과 개수">
+            {[3, 5, 10].map((count) => (
+              <button
+                key={count}
+                type="button"
+                className={topN === count ? "active" : ""}
+                onClick={() => {
+                  setTopN(count);
+                  clearSearchResults();
+                }}
+              >
+                {count}
+              </button>
+            ))}
+          </div>
+
+          <div className="studio-actions">
+            <button type="submit" className="studio-primary" disabled={isSearching}>
+              {isSearching ? "검색 중" : "검색"}
+            </button>
+            <button type="button" onClick={loadBudgetSets} disabled={isLoadingBudgetSets}>
+              {isLoadingBudgetSets ? "구성 중" : "코디"}
+            </button>
+            <button type="button" onClick={loadAiRecommendations} disabled={isRefreshingRecommendations}>
+              {isRefreshingRecommendations ? "생성 중" : "이유"}
+            </button>
+          </div>
+
+          {recommendationError ? <p className="studio-alert">{recommendationError}</p> : null}
+          {budgetSetError ? <p className="studio-alert">{budgetSetError}</p> : null}
+
+          <details className="studio-debug">
+            <summary>debug</summary>
+            <span>{helperMessage}</span>
+            <span>{modeLabel}</span>
+            <span>{mergedSearchLatency}</span>
+          </details>
+        </form>
+      </aside>
+
+      <main className="studio-main">
+        <section className="studio-board">
+          <header className="studio-board-header">
+            <div>
+              <span className="studio-kicker">Results</span>
+              <h1>{hasSearched ? query || "이미지 검색" : "새 검색"}</h1>
+            </div>
+            <div className="studio-board-tools">
+              <span>{selectedAudienceLabel}</span>
+              <span>{mergedSearchResults.length} items</span>
+              <span>{budgetLabel}</span>
+            </div>
+          </header>
+
+          <div className="studio-tabs" role="group" aria-label="결과 정렬">
+            <button
+              type="button"
+              className={searchResultView === "personalized" ? "active" : ""}
+              onClick={() => setSearchResultView("personalized")}
+            >
+              취향순
+            </button>
+            <button
+              type="button"
+              className={searchResultView === "similarity" ? "active" : ""}
+              onClick={() => setSearchResultView("similarity")}
+            >
+              유사도순
+            </button>
           </div>
 
           {mergedSearchResults.length === 0 ? (
-            <div className="empty-state">
+            <div className="studio-empty">
               <p>{searchEmptyMessage}</p>
             </div>
           ) : (
-            <div className="result-list">
+            <div className="studio-product-grid">
               {mergedSearchResults.map((item) => (
-                <article key={item.id} className="result-card">
+                <article key={item.id} className="studio-product-card">
                   <ResultVisual imageUrl={item.imageUrl} title={item.title} accent={item.accent} />
-                  <div className="result-meta">
-                    <div className="result-topline">
-                      <p>{item.brand}</p>
+                  <div className="studio-product-copy">
+                    <div>
+                      <span>{item.brand}</span>
                       <strong>{item.price}</strong>
                     </div>
-                    <h4>{item.title}</h4>
+                    <h2>{item.title}</h2>
                     <p>{item.summary}</p>
-                    <div className="result-stats">
-                      <span className="badge">
-                        {mergedSearchScoreLabel} {toDisplayPercent(item.similarity)}
-                      </span>
-                      <span className="badge">{item.searchType}</span>
-                      <span className="badge">응답 {item.responseTime}</span>
-                      {hasPersonalizedSearchResults ? (
-                        <span className="badge">{searchResultPersona}</span>
-                      ) : null}
-                    </div>
+                    <footer>
+                      <span>{mergedSearchScoreLabel} {toDisplayPercent(item.similarity)}</span>
+                      <span>{item.searchType}</span>
+                      {hasPersonalizedSearchResults ? <span>{searchResultPersona}</span> : null}
+                    </footer>
                   </div>
                 </article>
               ))}
@@ -828,100 +925,56 @@ function App() {
           )}
         </section>
 
-        <section className="panel">
-          <div className="section-heading">
+        <section className="studio-outfit-board">
+          <header className="studio-board-header compact">
             <div>
-              <p className="eyebrow">Budget Set</p>
-              <h3>예산 맞춤 추천</h3>
+              <span className="studio-kicker">Outfits</span>
+              <h2>예산 코디</h2>
             </div>
-            <div className="heading-metrics">
-              <span className="metric">예산 {budgetLabel}</span>
-              <span className="metric">세트 수 {budgetSets.setCount}</span>
-            </div>
-          </div>
-
-          <div className="recommendation-toolbar">
-            <div className="recommendation-controls">
-              <label className="user-id-field">
-                <span>User ID</span>
-                <input
-                  value={userId}
-                  onChange={(event) => setUserId(event.target.value)}
-                  placeholder="예: user_1024"
-                  aria-label="예산 세트 사용자 ID"
-                />
-              </label>
-              <label className="user-id-field budget-field">
-                <span>예산</span>
-                <input
-                  type="number"
-                  min="0"
-                  step="1000"
-                  value={budget}
-                  onChange={(event) => setBudget(event.target.value)}
-                  placeholder="예: 200000"
-                  aria-label="예산 세트 예산"
-                />
-              </label>
-            </div>
-            <div className="recommendation-actions">
-              <button
-                type="button"
-                className="primary-button"
-                onClick={loadBudgetSets}
-                disabled={isLoadingBudgetSets}
-              >
-                {isLoadingBudgetSets ? "세트 구성 중..." : "예산 적용하기"}
-              </button>
-            </div>
-          </div>
-
-          {budgetSetError ? <p className="status-text">{budgetSetError}</p> : null}
+            <span className="studio-budget-pill">{budgetSets.setCount} sets</span>
+          </header>
 
           {budgetSets.sets.length === 0 ? (
-            <p className="status-text">예산을 입력하고 적용하면 검색 결과에 반영됩니다.</p>
-          ) : null}
+            <div className="studio-empty compact">
+              <p>코디 결과 없음</p>
+            </div>
+          ) : (
+            <div className="studio-outfit-list">
+              {budgetSets.sets.map((setItems, setIndex) => {
+                const totalPrice =
+                  setItems[0]?.setTotalPrice ??
+                  setItems.reduce((sum, item) => sum + parseWonAmount(item.price), 0);
+                const budgetUsage = parsedBudget > 0 ? Math.min(100, (totalPrice / parsedBudget) * 100) : 0;
 
-          <div className="recommendation-list">
-            {budgetSets.sets.map((setItems, setIndex) => (
-              <article key={`set-${setIndex}`} className="panel">
-                <div className="section-heading">
-                  <div>
-                    <p className="eyebrow">Outfit Set</p>
-                    <h3>세트 {setIndex + 1}</h3>
-                  </div>
-                  <div className="heading-metrics">
-                    <span className="metric">
-                      총액{" "}
-                      {setItems
-                        .reduce((sum, item) => sum + Number(item.price.replace(/[^0-9]/g, "") || 0), 0)
-                        .toLocaleString("ko-KR")}
-                      원
-                    </span>
-                  </div>
-                </div>
-                <div className="result-list">
-                  {setItems.map((item) => (
-                    <div key={`${setIndex}-${item.id}`} className="result-card">
-                      <ResultVisual imageUrl={item.imageUrl} title={item.title} accent={item.accent} />
-                      <div className="result-meta">
-                        <div className="result-topline">
-                          <p>{item.brand}</p>
-                          <strong>{item.price}</strong>
-                        </div>
-                        <h4>{item.title}</h4>
-                        <p>{item.category}</p>
-                        <div className="result-stats">
-                          <span className="badge">세트 점수 {toDisplayPercent(item.score)}</span>
-                          <span className="badge">{item.category}</span>
-                        </div>
+                return (
+                  <article key={`set-${setIndex}`} className="studio-outfit-card">
+                    <div className="studio-outfit-head">
+                      <div>
+                        <span>Set {setIndex + 1}</span>
+                        <strong>{formatWonAmount(totalPrice)}</strong>
                       </div>
+                      <em>{toDisplayPercent(setItems[0]?.setScore ?? 0)}</em>
                     </div>
-                  ))}
-                </div>
-              </article>
-            ))}
-          </div>
+                    <div className="studio-meter" aria-label={`예산 사용률 ${budgetUsage.toFixed(0)}%`}>
+                      <span style={{ width: `${budgetUsage}%` }} />
+                    </div>
+                    <div className="studio-outfit-items">
+                      {setItems.map((item) => (
+                        <div key={`${setIndex}-${item.id}`} className="studio-outfit-item">
+                          <ResultVisual imageUrl={item.imageUrl} title={item.title} accent={item.accent} />
+                          <div>
+                            <span>{item.category}</span>
+                            <strong>{item.title}</strong>
+                            <p>{item.price}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
         </section>
       </main>
     </div>

@@ -187,6 +187,7 @@ def _load_article_meta() -> dict[str, dict]:
             aid = row.get("article_id", "").strip()
             if aid:
                 department_name = row.get("department_name", "")
+                section_name = row.get("section_name", "")
                 meta[aid] = {
                     "name": row.get("prod_name", ""),
                     "brand": _brand_label(department_name),
@@ -195,6 +196,9 @@ def _load_article_meta() -> dict[str, dict]:
                     "color": row.get("color", ""),
                     "product_type": row.get("product_type_name", ""),
                     "product_group": row.get("product_group_name", ""),
+                    "department_name": department_name,
+                    "section_name": section_name,
+                    "garment_group": row.get("garment_group_name", ""),
                     "price": 0,
                     "price_source": "",
                 }
@@ -302,10 +306,26 @@ COLOR_INTENT_TERMS: dict[str, str] = {
 
 TARGET_AUDIENCE_TO_MAIN_CATEGORY: dict[str, set[str]] = {
     "all": set(),
-    "women": {"Ladieswear"},
+    "women": {"Ladieswear", "Divided"},
     "men": {"Menswear"},
     "kids": {"Baby/Children"},
 }
+
+TARGET_AUDIENCE_EXCLUDED_MAIN_CATEGORY: dict[str, set[str]] = {
+    "women": {"Menswear", "Baby/Children"},
+    "men": {"Ladieswear", "Divided", "Baby/Children"},
+    "kids": {"Ladieswear", "Menswear", "Divided", "Sport"},
+}
+
+TARGET_AUDIENCE_TOKEN_MARKERS: dict[str, set[str]] = {
+    "women": {"ladies", "ladieswear", "lady", "women", "womens", "woman", "female"},
+    "men": {"men", "mens", "menswear", "man", "male"},
+    "kids": {"baby", "children", "child", "kids", "kid", "boy", "boys", "girl", "girls", "toddler"},
+}
+OUTFIT_ITEM_FIT_WEIGHT = 0.45
+OUTFIT_COMPATIBILITY_WEIGHT = 0.25
+OUTFIT_QUERY_MATCH_WEIGHT = 0.20
+OUTFIT_BUDGET_FIT_WEIGHT = 0.10
 
 TARGET_AUDIENCE_TO_INTEREST: dict[str, str] = {
     "women": "Ladieswear",
@@ -319,12 +339,37 @@ def _normalize_target_audience(target_audience: str | None) -> str:
     return target if target in TARGET_AUDIENCE_TO_MAIN_CATEGORY else "all"
 
 
+def _target_audience_tokens(item: dict) -> set[str]:
+    text = " ".join(
+        str(item.get(key, "") or "")
+        for key in (
+            "main_category",
+            "department_name",
+            "section_name",
+            "garment_group",
+            "garment_group_name",
+            "brand",
+        )
+    )
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _tokens_match_audience(tokens: set[str], target_audience: str) -> bool:
+    markers = TARGET_AUDIENCE_TOKEN_MARKERS.get(target_audience, set())
+    return any(token in markers for token in tokens)
+
+
 def _item_matches_target_audience(item: dict, target_audience: str | None) -> bool:
     target = _normalize_target_audience(target_audience)
-    allowed = TARGET_AUDIENCE_TO_MAIN_CATEGORY[target]
-    if not allowed:
+    if target == "all":
         return True
-    return str(item.get("main_category", "")).strip() in allowed
+
+    main_category = str(item.get("main_category", "") or "").strip()
+    if main_category in TARGET_AUDIENCE_TO_MAIN_CATEGORY[target]:
+        return True
+    if main_category in TARGET_AUDIENCE_EXCLUDED_MAIN_CATEGORY.get(target, set()):
+        return False
+    return _tokens_match_audience(_target_audience_tokens(item), target)
 
 
 def _apply_target_audience_filter(
@@ -332,12 +377,22 @@ def _apply_target_audience_filter(
     target_audience: str | None,
     *,
     min_results: int = 1,
+    warn_below: int | None = None,
 ) -> list[dict]:
     target = _normalize_target_audience(target_audience)
     if target == "all":
         return items
     filtered = [item for item in items if _item_matches_target_audience(item, target)]
-    return filtered if len(filtered) >= min_results else items
+    threshold = min_results if warn_below is None else warn_below
+    if len(filtered) < threshold:
+        logging.info(
+            "Target audience filter reduced results below requested minimum: target=%s before=%d after=%d min=%d",
+            target,
+            len(items),
+            len(filtered),
+            threshold,
+        )
+    return filtered
 
 
 def _target_audience_interest(target_audience: str | None) -> str | None:
@@ -1067,6 +1122,9 @@ def _catalog_item_for_article(article_id: str, meta: dict, *, score: float) -> d
         "product_type": meta.get("product_type", ""),
         "brand": meta.get("brand") or "H&M",
         "main_category": meta.get("main_category", ""),
+        "department_name": meta.get("department_name", ""),
+        "section_name": meta.get("section_name", ""),
+        "garment_group": meta.get("garment_group", ""),
         "price_estimated": price_estimated,
         "price_source": _price_source_label(meta, price_estimated),
         "reason": "catalog_constraint_backfill",
@@ -1080,6 +1138,7 @@ def _catalog_constraint_candidates(
     existing_ids: set[str],
     limit: int,
     require_color: bool,
+    target_audience: str | None = None,
 ) -> list[dict]:
     if not constraints["products"] or limit <= 0:
         return []
@@ -1099,7 +1158,12 @@ def _catalog_constraint_candidates(
             "product_type": meta.get("product_type", ""),
             "color": meta.get("color", ""),
             "main_category": meta.get("main_category", ""),
+            "department_name": meta.get("department_name", ""),
+            "section_name": meta.get("section_name", ""),
+            "garment_group": meta.get("garment_group", ""),
         }
+        if not _item_matches_target_audience(candidate, target_audience):
+            continue
         if not _item_matches_query_constraints(candidate, effective_constraints):
             continue
 
@@ -1116,12 +1180,19 @@ def _catalog_constraint_candidates(
     return matches
 
 
-def _with_catalog_constraint_backfill(items: list[dict], constraints: dict[str, set[str]], *, min_results: int) -> list[dict]:
+def _with_catalog_constraint_backfill(
+    items: list[dict],
+    constraints: dict[str, set[str]],
+    *,
+    min_results: int,
+    target_audience: str | None = None,
+) -> list[dict]:
     if not constraints["products"] or min_results <= 0:
         return items
 
     existing_ids = {str(item.get("product_id", item.get("article_id", ""))) for item in items}
-    matching_count = len(_query_constraint_matches(items, constraints))
+    target_filtered_items = _apply_target_audience_filter(items, target_audience)
+    matching_count = len(_query_constraint_matches(target_filtered_items, constraints))
     missing_count = max(0, min_results - matching_count)
     if missing_count <= 0:
         return items
@@ -1131,6 +1202,7 @@ def _with_catalog_constraint_backfill(items: list[dict], constraints: dict[str, 
         existing_ids=existing_ids,
         limit=missing_count,
         require_color=bool(constraints["colors"]),
+        target_audience=target_audience,
     )
     if len(backfill_items) < missing_count and constraints["colors"]:
         backfill_items.extend(
@@ -1139,6 +1211,7 @@ def _with_catalog_constraint_backfill(items: list[dict], constraints: dict[str, 
                 existing_ids=existing_ids,
                 limit=missing_count - len(backfill_items),
                 require_color=False,
+                target_audience=target_audience,
             )
         )
     return items + backfill_items
@@ -1946,9 +2019,12 @@ def _enrich_search_results(items: list[dict]) -> list[dict]:
             "name": meta.get("name") or item.get("name") or pid,
             "brand": meta.get("brand") or "H&M",
             "category": meta.get("category", item.get("category", "")),
-            "main_category": meta.get("main_category", ""),
+            "main_category": meta.get("main_category") or item.get("main_category", ""),
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
+            "department_name": meta.get("department_name", item.get("department_name", "")),
+            "section_name": meta.get("section_name", item.get("section_name", "")),
+            "garment_group": meta.get("garment_group", item.get("garment_group", "")),
             "price": price,
             "price_estimated": price_estimated,
             "price_source": _price_source_label(meta, price_estimated),
@@ -1969,9 +2045,12 @@ def _enrich_recommendation_results(items: list[dict]) -> list[dict]:
             "name": meta.get("name") or pid,
             "brand": meta.get("brand") or "H&M",
             "category": meta.get("category", ""),
-            "main_category": meta.get("main_category", ""),
+            "main_category": meta.get("main_category") or item.get("main_category", ""),
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
+            "department_name": meta.get("department_name", item.get("department_name", "")),
+            "section_name": meta.get("section_name", item.get("section_name", "")),
+            "garment_group": meta.get("garment_group", item.get("garment_group", "")),
             "price": price,
             "price_estimated": price_estimated,
             "price_source": _price_source_label(meta, price_estimated),
@@ -2097,6 +2176,7 @@ async def personalized_search(req: PersonalizedSearchRequest):
             enriched_search_results,
             search_constraints,
             min_results=search_top_k,
+            target_audience=target_audience,
         )
         enriched_search_results = _prioritize_query_constraint_matches(
             enriched_search_results,
@@ -2861,6 +2941,12 @@ _OUTFIT_TEMPLATES = [
 ]
 
 
+def _clamp_unit_score(value: float, *, minimum: float = 0.0) -> float:
+    if not isinstance(value, (int, float)):
+        return minimum
+    return max(minimum, min(float(value), 1.0))
+
+
 def _build_outfit_sets(
     candidates: list[dict],
     sim_matrix: dict,
@@ -2878,9 +2964,16 @@ def _build_outfit_sets(
     템플릿에 따라 예산 내 세트를 구성한다. 후보 풀에 없는 슬롯은 전체 카탈로그에서 보충한다.
     """
     DEFAULT_PRICE = 25000
-    allowed_main_cats = TARGET_AUDIENCE_TO_MAIN_CATEGORY.get(target_audience or "all", set())
+    target_audience = _normalize_target_audience(target_audience)
+    anchor_ids = anchor_ids or set()
+    complement_ids = complement_ids or set()
+    raw_query_constraints = query_constraints or {}
+    query_constraints = {
+        "colors": set(raw_query_constraints.get("colors", set())),
+        "products": set(raw_query_constraints.get("products", set())),
+    }
 
-    def to_catalog_item(aid: str, score: float = 0.0) -> dict:
+    def to_catalog_item(aid: str, score: float = 0.12) -> dict:
         meta = article_meta.get(aid, {})
         price = int(meta.get("price") or 0) or DEFAULT_PRICE
         return {
@@ -2894,10 +2987,120 @@ def _build_outfit_sets(
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
             "product_group": meta.get("product_group", ""),
+            "department_name": meta.get("department_name", ""),
+            "section_name": meta.get("section_name", ""),
+            "garment_group": meta.get("garment_group", ""),
             "brand": meta.get("brand", ""),
             "image_url": image_url_for_article(aid),
             "price_estimated": not bool(meta.get("price")),
         }
+
+    def normalized_raw_score(item: dict, max_raw_score: float) -> float:
+        raw_score = float(item.get("score") or 0.0)
+        if raw_score <= 0 or max_raw_score <= 0:
+            return 0.0
+        return _clamp_unit_score(raw_score / max_raw_score)
+
+    def item_fit_score(item: dict, max_raw_score: float) -> float:
+        aid = str(item.get("article_id") or item.get("product_id", ""))
+        raw_score = float(item.get("score") or 0.0)
+        score = 0.12
+
+        if raw_score > 0:
+            score = 0.35 + (0.35 * normalized_raw_score(item, max_raw_score))
+
+        if aid in anchor_ids:
+            score += 0.12
+        elif aid in complement_ids:
+            score += 0.08
+
+        if query_constraints["products"] and _item_matches_query_product(item, query_constraints):
+            score += 0.10
+        if query_constraints["colors"] and _item_matches_query_color(item, query_constraints):
+            score += 0.05
+        if _item_matches_target_audience(item, target_audience):
+            score += 0.03
+
+        return round(_clamp_unit_score(score, minimum=0.05), 6)
+
+    def pairwise_compatibility(outfit: list[dict]) -> float:
+        values: list[float] = []
+        for left_index, left in enumerate(outfit):
+            left_id = str(left.get("article_id") or left.get("product_id", ""))
+            for right in outfit[left_index + 1:]:
+                right_id = str(right.get("article_id") or right.get("product_id", ""))
+                raw_value = (
+                    sim_matrix.get(left_id, {}).get(right_id)
+                    if isinstance(sim_matrix.get(left_id), dict)
+                    else None
+                )
+                if raw_value is None and isinstance(sim_matrix.get(right_id), dict):
+                    raw_value = sim_matrix.get(right_id, {}).get(left_id)
+                if raw_value is None:
+                    continue
+                values.append(_clamp_unit_score(float(raw_value)))
+
+        if values:
+            return sum(values) / len(values)
+
+        item_scores = [float(item.get("item_score") or 0.0) for item in outfit]
+        return (sum(item_scores) / len(item_scores)) * 0.7 if item_scores else 0.0
+
+    def query_match_score(outfit: list[dict]) -> float:
+        has_product = bool(query_constraints["products"])
+        has_color = bool(query_constraints["colors"])
+        if not has_product and not has_color:
+            return 0.65
+
+        scores: list[float] = []
+        for item in outfit:
+            total = 0
+            matched = 0
+            if has_product:
+                total += 1
+                matched += 1 if _item_matches_query_product(item, query_constraints) else 0
+            if has_color:
+                total += 1
+                matched += 1 if _item_matches_query_color(item, query_constraints) else 0
+            if total:
+                scores.append(matched / total)
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def budget_fit_score(total_price: int) -> float:
+        if budget <= 0 or total_price <= 0:
+            return 0.0
+        usage = min(total_price / budget, 1.0)
+        if usage <= 0.85:
+            return usage / 0.85
+        return max(0.7, 1.0 - ((usage - 0.85) / 0.15) * 0.3)
+
+    def score_outfit(outfit: list[dict], total_price: int) -> list[dict]:
+        item_scores = [float(item.get("item_score") or 0.0) for item in outfit]
+        average_item_score = sum(item_scores) / len(item_scores) if item_scores else 0.0
+        compatibility = pairwise_compatibility(outfit)
+        query_score = query_match_score(outfit)
+        budget_score = budget_fit_score(total_price)
+        set_score = (
+            (OUTFIT_ITEM_FIT_WEIGHT * average_item_score)
+            + (OUTFIT_COMPATIBILITY_WEIGHT * compatibility)
+            + (OUTFIT_QUERY_MATCH_WEIGHT * query_score)
+            + (OUTFIT_BUDGET_FIT_WEIGHT * budget_score)
+        )
+        set_score = round(_clamp_unit_score(set_score, minimum=0.01), 6)
+
+        return [
+            {
+                **item,
+                "score": set_score,
+                "set_score": set_score,
+                "item_score": round(float(item.get("item_score") or 0.0), 6),
+                "compatibility_score": round(compatibility, 6),
+                "query_match_score": round(query_score, 6),
+                "budget_fit_score": round(budget_score, 6),
+                "set_total_price": total_price,
+            }
+            for item in outfit
+        ]
 
     # 후보를 slot별로 분류
     slot_pools: dict[str, list[dict]] = {}
@@ -2907,7 +3110,10 @@ def _build_outfit_sets(
             continue
         meta = article_meta.get(aid, {})
         slot = _outfit_slot(meta)
-        slot_pools.setdefault(slot, []).append({**item, "article_id": aid})
+        candidate_item = {**item, "article_id": aid}
+        if not _item_matches_target_audience(candidate_item, target_audience):
+            continue
+        slot_pools.setdefault(slot, []).append(candidate_item)
 
     # 부족한 슬롯은 전체 카탈로그에서 보충 (target_audience 필터 적용)
     needed_slots = {"top", "bottom", "outer", "dress", "accessory", "shoes"}
@@ -2919,11 +3125,17 @@ def _build_outfit_sets(
                     break
                 if aid in existing_ids:
                     continue
-                if allowed_main_cats:
-                    item_main_cat = article_meta.get(aid, {}).get("main_category", "")
-                    if item_main_cat not in allowed_main_cats:
-                        continue
-                slot_pools.setdefault(slot, []).append(to_catalog_item(aid))
+                catalog_item = to_catalog_item(aid)
+                if not _item_matches_target_audience(catalog_item, target_audience):
+                    continue
+                slot_pools.setdefault(slot, []).append(catalog_item)
+
+    all_slot_items = [item for pool in slot_pools.values() for item in pool]
+    max_raw_score = max((float(item.get("score") or 0.0) for item in all_slot_items), default=0.0)
+    for slot, pool in slot_pools.items():
+        for item in pool:
+            item["item_score"] = item_fit_score(item, max_raw_score)
+        pool.sort(key=lambda item: float(item.get("item_score") or 0.0), reverse=True)
 
     sets: list[list[dict]] = []
     used_ids: set[str] = set()
@@ -2950,10 +3162,11 @@ def _build_outfit_sets(
                 break  # 슬롯당 1개
 
         if len(outfit) >= 2:
-            sets.append(outfit)
+            sets.append(score_outfit(outfit, cost))
             for item in outfit:
                 used_ids.add(item["article_id"])
 
+    sets.sort(key=lambda outfit: float(outfit[0].get("set_score") or 0.0), reverse=True)
     return sets
 
 

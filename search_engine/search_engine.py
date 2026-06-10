@@ -7,6 +7,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,12 @@ SEARCH_INDEX_FILENAMES = {
 }
 SEARCH_INDEX_FORMAT = "clip_multimodal_v4"
 SUPPORTED_SEARCH_INDEX_FORMATS = {SEARCH_INDEX_FORMAT}
+IMAGE_COLOR_RERANK_MIN_POOL = int(os.getenv("IMAGE_COLOR_RERANK_MIN_POOL", "100"))
+IMAGE_COLOR_RERANK_MULTIPLIER = int(os.getenv("IMAGE_COLOR_RERANK_MULTIPLIER", "4"))
+IMAGE_COLOR_EXACT_BOOST = float(os.getenv("IMAGE_COLOR_EXACT_BOOST", "1.08"))
+IMAGE_COLOR_NEUTRAL_BOOST = float(os.getenv("IMAGE_COLOR_NEUTRAL_BOOST", "1.03"))
+IMAGE_COLOR_MISMATCH_PENALTY = float(os.getenv("IMAGE_COLOR_MISMATCH_PENALTY", "0.95"))
+IMAGE_COLOR_RERANK_MIN_CONFIDENCE = float(os.getenv("IMAGE_COLOR_RERANK_MIN_CONFIDENCE", "0.35"))
 CSV_STRING_COLUMNS = {
     "article_id": str,
     "product_code": str,
@@ -118,6 +125,123 @@ class SearchResult:
     item_id: str
     score: float
     metadata: Dict[str, Any]
+
+
+COLOR_FAMILY_ALIASES: dict[str, str] = {
+    "black": "black",
+    "grey": "gray",
+    "gray": "gray",
+    "silver": "gray",
+    "white": "white",
+    "off white": "white",
+    "cream": "white",
+    "beige": "beige",
+    "brown": "brown",
+    "blue": "blue",
+    "navy": "blue",
+    "turquoise": "blue",
+    "red": "red",
+    "burgundy": "red",
+    "pink": "pink",
+    "purple": "purple",
+    "lilac": "purple",
+    "green": "green",
+    "khaki": "green",
+    "yellow": "yellow",
+    "orange": "orange",
+}
+NEUTRAL_COLOR_FAMILIES = {"black", "gray", "white"}
+
+
+def normalize_color_family(color_text: Any) -> Optional[str]:
+    text = str(color_text or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"[^a-z\s/,-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+
+    for alias, family in COLOR_FAMILY_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", text):
+            return family
+    return None
+
+
+def color_family_from_rgb(red: int, green: int, blue: int) -> str:
+    r, g, b = red / 255.0, green / 255.0, blue / 255.0
+    max_value = max(r, g, b)
+    min_value = min(r, g, b)
+    chroma = max_value - min_value
+
+    if max_value < 0.22:
+        return "black"
+    if chroma < 0.10:
+        if max_value > 0.86:
+            return "white"
+        return "gray"
+
+    if max_value == r:
+        hue = ((g - b) / chroma) % 6
+    elif max_value == g:
+        hue = ((b - r) / chroma) + 2
+    else:
+        hue = ((r - g) / chroma) + 4
+    hue_degrees = hue * 60
+
+    if hue_degrees < 20 or hue_degrees >= 345:
+        return "red"
+    if hue_degrees < 45:
+        return "orange"
+    if hue_degrees < 70:
+        return "yellow"
+    if hue_degrees < 165:
+        return "green"
+    if hue_degrees < 255:
+        return "blue"
+    if hue_degrees < 295:
+        return "purple"
+    return "pink"
+
+
+def dominant_color_signal_from_image(image: Image.Image) -> tuple[Optional[str], float]:
+    try:
+        rgb_image = image.convert("RGB")
+    except Exception:
+        return None, 0.0
+
+    width, height = rgb_image.size
+    if width <= 0 or height <= 0:
+        return None, 0.0
+
+    left = int(width * 0.15)
+    top = int(height * 0.15)
+    right = max(left + 1, int(width * 0.85))
+    bottom = max(top + 1, int(height * 0.85))
+    rgb_image = rgb_image.crop((left, top, right, bottom)).resize((64, 64))
+
+    counts: dict[str, float] = {}
+    for red, green, blue in rgb_image.getdata():
+        family = color_family_from_rgb(int(red), int(green), int(blue))
+        counts[family] = counts.get(family, 0.0) + 1.0
+
+    if not counts:
+        return None, 0.0
+
+    total = sum(counts.values())
+    white_share = counts.get("white", 0.0) / total if total else 0.0
+    if white_share > 0.45:
+        non_white = {family: count for family, count in counts.items() if family != "white"}
+        if non_white and (sum(non_white.values()) / total) >= 0.08:
+            family = max(non_white, key=non_white.get)
+            return family, non_white[family] / total
+    family = max(counts, key=counts.get)
+    return family, counts[family] / total
+
+
+def dominant_color_family_from_image(image: Image.Image) -> Optional[str]:
+    family, _confidence = dominant_color_signal_from_image(image)
+    return family
 
 
 def encode_image_file(path: Path | str) -> Optional[Image.Image]:
@@ -1163,6 +1287,79 @@ class MultimodalSearchEngine:
             )
         return hits
 
+    @staticmethod
+    def _metadata_color_family(metadata: Dict[str, Any]) -> Optional[str]:
+        for key in (
+            "color",
+            "perceived_colour_master_name",
+            "colour_group_name",
+            "perceived_colour_value_name",
+        ):
+            family = normalize_color_family(metadata.get(key))
+            if family:
+                return family
+        return None
+
+    @staticmethod
+    def _image_color_signal(image: Optional[Image.Image], image_bytes: Optional[bytes]) -> tuple[Optional[str], float]:
+        if image is not None:
+            family, confidence = dominant_color_signal_from_image(image)
+            if family:
+                return family, confidence
+        if not image_bytes:
+            return None, 0.0
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as opened_image:
+                return dominant_color_signal_from_image(opened_image)
+        except Exception:
+            LOGGER.debug("Failed to extract dominant color from query image", exc_info=True)
+            return None, 0.0
+
+    @staticmethod
+    def _color_score_multiplier(query_color: Optional[str], item_color: Optional[str]) -> float:
+        if not query_color or not item_color:
+            return 1.0
+        if query_color == item_color:
+            return IMAGE_COLOR_EXACT_BOOST
+        if query_color in NEUTRAL_COLOR_FAMILIES and item_color in NEUTRAL_COLOR_FAMILIES:
+            if {query_color, item_color} == {"black", "white"}:
+                return 0.97
+            return IMAGE_COLOR_NEUTRAL_BOOST
+        return IMAGE_COLOR_MISMATCH_PENALTY
+
+    def _rerank_results_by_image_color(
+        self,
+        results: Sequence[SearchResult],
+        query_color: Optional[str],
+        query_color_confidence: float = 0.0,
+    ) -> List[SearchResult]:
+        if not query_color:
+            return list(results)
+
+        reranked: list[tuple[float, int, SearchResult]] = []
+        for index, result in enumerate(results):
+            metadata = dict(result.metadata or {})
+            item_color = self._metadata_color_family(metadata)
+            multiplier = self._color_score_multiplier(query_color, item_color)
+            reranked.append((
+                float(result.score) * multiplier,
+                index,
+                SearchResult(
+                    item_id=result.item_id,
+                    score=float(result.score) * multiplier,
+                    metadata={
+                        **metadata,
+                        "image_query_color": query_color,
+                        "image_query_color_confidence": round(query_color_confidence, 4),
+                        "item_color_family": item_color or "",
+                        "color_rerank_multiplier": round(multiplier, 4),
+                    },
+                ),
+            ))
+
+        reranked.sort(key=lambda item: (-item[0], item[1]))
+        return [result for _, _, result in reranked]
+
     def _embedding_matrix_for_modality(self, modality: str) -> np.ndarray:
         normalized_modality = (modality or "multimodal").strip().lower()
         if normalized_modality in {"multimodal", "combined", "hybrid"}:
@@ -1474,6 +1671,17 @@ class MultimodalSearchEngine:
             raise RuntimeError("Search index is not initialized")
 
         top_k = max(1, int(top_k or self.top_k_default))
+        image_query_color, image_query_color_confidence = self._image_color_signal(image, image_bytes)
+        color_rerank_enabled = (
+            bool(image_query_color)
+            and image_query_color_confidence >= IMAGE_COLOR_RERANK_MIN_CONFIDENCE
+        )
+        search_top_k = top_k
+        if color_rerank_enabled and len(self.items) > top_k:
+            search_top_k = min(
+                len(self.items),
+                max(top_k, IMAGE_COLOR_RERANK_MIN_POOL, top_k * IMAGE_COLOR_RERANK_MULTIPLIER),
+            )
         started = time.perf_counter()
         prepared_query = self._expand_query_terms(query or "")
         query_vec, search_type = self.embedder.embed_query(
@@ -1491,9 +1699,15 @@ class MultimodalSearchEngine:
             }
 
         if search_type == "image":
-            vector_results = self._search_image_mode(query_vec, image_bytes=image_bytes, top_k=top_k)
+            vector_results = self._search_image_mode(query_vec, image_bytes=image_bytes, top_k=search_top_k)
         else:
-            vector_results = self._search_from_vector(query_vec, top_k)
+            vector_results = self._search_from_vector(query_vec, search_top_k)
+        if color_rerank_enabled:
+            vector_results = self._rerank_results_by_image_color(
+                vector_results,
+                image_query_color,
+                image_query_color_confidence,
+            )[:top_k]
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         results: List[Dict[str, Any]] = []
@@ -1505,6 +1719,10 @@ class MultimodalSearchEngine:
                     "name": str(meta.get("name", "")),
                     "score": round(float(hit.score), 10),
                     "price": round(float(meta.get("price", 0.0)), 10),
+                    "image_query_color": meta.get("image_query_color", ""),
+                    "image_query_color_confidence": meta.get("image_query_color_confidence", 0.0),
+                    "item_color_family": meta.get("item_color_family", ""),
+                    "color_rerank_multiplier": meta.get("color_rerank_multiplier", 1.0),
                 }
             )
 
@@ -1513,6 +1731,9 @@ class MultimodalSearchEngine:
             "results": results,
             "latency_ms": round(latency_ms, 3),
             "total_count": len(results),
+            "image_query_color": image_query_color or "",
+            "image_query_color_confidence": round(image_query_color_confidence, 4),
+            "color_rerank_applied": color_rerank_enabled,
         }
 
     def __len__(self) -> int:

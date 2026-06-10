@@ -244,6 +244,13 @@ rec_models/reports/baseline/dev_serving_latency_top50_50users_optimized.json
 rec_models/reports/baseline/dev_serving_latency_top50_50users_pool2.json
 rec_models/reports/baseline/dev_serving_latency_top50_50users_pool4.json
 
+# Local-only MAP@12 comparison experiments
+local_eval/
+rec_models/reports/map12_comparison/
+*map12_comparison*.csv
+*map12_comparison*.json
+*map12_comparison*.md
+
 # Non-final recommendation experiment reports
 rec_models/reports/baseline/2026-05-03_*.json
 rec_models/reports/baseline/dev_e2e_twotower_serving.json
